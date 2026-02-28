@@ -49,7 +49,7 @@ func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) er
 		return err
 	}
 
-	// Sadece call.started ve dtmf (ileride) dinliyoruz
+	// call.started dinliyoruz
 	err = ch.QueueBind(q.Name, "call.started", exchangeName, false, nil)
 	if err != nil {
 		return err
@@ -89,7 +89,6 @@ func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) er
 }
 
 func (c *Consumer) handleMessage(ctx context.Context, d amqp091.Delivery) {
-	// Gelen veriyi (JSON) map olarak parse et (Tip bağımsız)
 	var payload map[string]interface{}
 	if err := json.Unmarshal(d.Body, &payload); err != nil {
 		c.log.Error().Err(err).Msg("Geçersiz RabbitMQ payload")
@@ -102,27 +101,34 @@ func (c *Consumer) handleMessage(ctx context.Context, d amqp091.Delivery) {
 	if eventType == "call.started" {
 		c.log.Info().Str("call_id", callID).Msg("📞 Yeni çağrı yakalandı. Workflow başlatılıyor...")
 
-		// 1. Dialplan Resolution verisini al
+		// 1. Dialplan Kararını Al
 		resolution, ok := payload["dialplanResolution"].(map[string]interface{})
 		if !ok {
-			c.log.Warn().Str("call_id", callID).Msg("Dialplan çözünürlüğü yok. Varsayılan akışa geçiliyor.")
 			return
 		}
 
-		// 2. Aksiyonu Bul
 		action, ok := resolution["action"].(map[string]interface{})
 		if !ok {
 			return
 		}
-
 		actionType, _ := action["action"].(string)
 
-		//[GEÇİCİ KÖPRÜ (BRIDGE) MANTIĞI]:
-		// Tam JSON veritabanına geçene kadar, gelen Action string'ini Workflow motoruna paslıyoruz.
-		// İleride bu actionType, doğrudan veritabanındaki "Workflow ID" olacak.
+		// 2. Medya Bilgilerini (RTP Port vb.) Al
+		var rtpPort uint32
+		var rtpTarget string
+		if mi, ok := payload["mediaInfo"].(map[string]interface{}); ok {
+			if p, ok := mi["serverRtpPort"].(float64); ok {
+				rtpPort = uint32(p)
+			}
+			if t, ok := mi["callerRtpAddr"].(string); ok {
+				rtpTarget = t
+			}
+		}
 
 		workflowDef := c.generateMockWorkflow(actionType)
-		c.processor.StartWorkflow(ctx, callID, workflowDef)
+
+		// [YENİ]: Artık rtp bilgilerini de Processora iletiyoruz
+		c.processor.StartWorkflow(ctx, callID, rtpPort, rtpTarget, workflowDef)
 	}
 }
 
@@ -149,6 +155,5 @@ func (c *Consumer) generateMockWorkflow(actionType string) string {
 		}`
 	}
 
-	// Fallback
 	return `{"id": "wf_empty", "start_node": "end", "steps": { "end": { "type": "hangup" } }}`
 }
