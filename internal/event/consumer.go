@@ -3,11 +3,13 @@ package event
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 
 	"github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
+	"google.golang.org/protobuf/proto"
+
+	eventv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/event/v1"
 	"github.com/sentiric/sentiric-workflow-service/internal/engine"
 )
 
@@ -89,52 +91,43 @@ func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) er
 }
 
 func (c *Consumer) handleMessage(ctx context.Context, d amqp091.Delivery) {
-	var payload map[string]interface{}
-	if err := json.Unmarshal(d.Body, &payload); err != nil {
-		c.log.Error().Err(err).Msg("Geçersiz RabbitMQ payload")
+	//[KRİTİK DÜZELTME]: Gelen veriyi JSON değil, Protobuf olarak parse ediyoruz.
+	var callStarted eventv1.CallStartedEvent
+	if err := proto.Unmarshal(d.Body, &callStarted); err != nil {
+		// Başka formatta bir event gelirse gürültü yapmamak için debug basıp geçiyoruz.
+		c.log.Debug().Err(err).Msg("Mesaj CallStartedEvent formatında değil, atlanıyor.")
 		return
 	}
 
-	eventType, _ := payload["eventType"].(string)
-	callID, _ := payload["callId"].(string)
-
-	if eventType == "call.started" {
+	if callStarted.EventType == "call.started" {
+		callID := callStarted.CallId
 		c.log.Info().Str("call_id", callID).Msg("📞 Yeni çağrı yakalandı. Workflow başlatılıyor...")
 
 		// 1. Dialplan Kararını Al
-		resolution, ok := payload["dialplanResolution"].(map[string]interface{})
-		if !ok {
+		if callStarted.DialplanResolution == nil || callStarted.DialplanResolution.Action == nil {
+			c.log.Warn().Str("call_id", callID).Msg("Dialplan Action eksik! Akış durduruldu.")
 			return
 		}
 
-		action, ok := resolution["action"].(map[string]interface{})
-		if !ok {
-			return
-		}
-		actionType, _ := action["action"].(string)
+		actionType := callStarted.DialplanResolution.Action.Action
 
 		// 2. Medya Bilgilerini (RTP Port vb.) Al
 		var rtpPort uint32
 		var rtpTarget string
-		if mi, ok := payload["mediaInfo"].(map[string]interface{}); ok {
-			if p, ok := mi["serverRtpPort"].(float64); ok {
-				rtpPort = uint32(p)
-			}
-			if t, ok := mi["callerRtpAddr"].(string); ok {
-				rtpTarget = t
-			}
+		if callStarted.MediaInfo != nil {
+			rtpPort = callStarted.MediaInfo.ServerRtpPort
+			rtpTarget = callStarted.MediaInfo.CallerRtpAddr
 		}
 
+		// 3. Workflow JSON'unu Üret ve Motora Ver
 		workflowDef := c.generateMockWorkflow(actionType)
-
-		// [YENİ]: Artık rtp bilgilerini de Processora iletiyoruz
 		c.processor.StartWorkflow(ctx, callID, rtpPort, rtpTarget, workflowDef)
 	}
 }
 
-// generateMockWorkflow: Veritabanı bağlantısı tam kurulana kadar (MVP için) JSON akışları üretir.
 func (c *Consumer) generateMockWorkflow(actionType string) string {
-	if actionType == "ECHO_TEST" {
+	// Gelen enum formatlarını da, string formatlarını da kapsayacak şekilde kontrol:
+	if actionType == "ECHO_TEST" || actionType == "ACTION_TYPE_ECHO_TEST" {
 		return `{
 			"id": "wf_echo_mock",
 			"start_node": "step_echo",
@@ -145,7 +138,7 @@ func (c *Consumer) generateMockWorkflow(actionType string) string {
 		}`
 	}
 
-	if actionType == "START_AI_CONVERSATION" {
+	if actionType == "START_AI_CONVERSATION" || actionType == "ACTION_TYPE_START_AI_CONVERSATION" {
 		return `{
 			"id": "wf_ai_mock",
 			"start_node": "step_handoff",
