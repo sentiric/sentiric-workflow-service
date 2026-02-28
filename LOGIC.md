@@ -1,28 +1,67 @@
-# 🧠 Workflow Service - Mantık Mimarisi
+# 🧠 Workflow Service - Mantık Mimarisi (The Cortex)
 
-**Rol:** The Cortex (Karar Verici Üst Katman).
+**Rol:** Merkezi Karar Motoru ve Süreç Yöneticisi.
 
-## 1. Çalışma Prensibi (The Engine)
+## 1. Mimari: Olay Güdümlü Durum Makinesi (Event-Driven State Machine)
 
-Servis, **Olay Güdümlü (Event-Driven)** çalışır. Kendi başına bir şey yapmaz, olaylara tepki verir.
+Bu servis, statik kod yerine, veritabanında saklanan **JSON Akış Şemalarını** (Blueprints) çalıştırır.
 
-### Akış Örneği: Echo Testi
+### Çekirdek Döngüsü
 
-1.  **Giriş:** `b2bua` -> `RabbitMQ` -> `call.started` (Dest: 9999).
-2.  **Karar:** `workflow-service` veritabanından `9999` için tanımlı akışı çeker: `wf_system_echo`.
-3.  **Adım 1:** JSON: `{"type": "play", "file": "welcome.wav"}`
-    *   Eylem: `media-service.PlayAudio(...)` gRPC çağrısı.
-4.  **Adım 2:** JSON: `{"type": "execute_command", "command": "media.enable_echo"}`
-    *   Eylem: `media-service`'e Echo komutu.
-5.  **Adım 3:** JSON: `{"type": "wait", "seconds": 60}`
-    *   Eylem: 60 saniye boyunca `sleep`.
+1.  **Trigger:** RabbitMQ'dan bir olay gelir (Örn: `call.started`, `dtmf.received`).
+2.  **Fetch:** `call_id` kullanılarak Redis'ten aktif oturum (`Session`) çekilir.
+3.  **Engine:** Mevcut adımdaki (`CurrentStep`) kurallar, gelen olayla karşılaştırılır.
+4.  **Transition:** Eğer kural eşleşirse, bir sonraki adıma (`NextStep`) geçilir.
+5.  **Action:** Yeni adımın gerektirdiği emir (gRPC) ilgili servise gönderilir.
 
-## 2. Agent Service ile Farkı
+## 2. Akış Diyagramı
 
-| Özellik | Workflow Service | Agent Service |
-| :--- | :--- | :--- |
-| **Metafor** | Yönetmen | Oyuncu |
-| **Görevi** | Sahneyi kurar, oyuncuyu çağırır. | Sahneye çıkar, diyaloğu gerçekleştirir. |
-| **Yetenek** | Akış kontrolü, bekleme, yönlendirme. | STT/TTS/LLM koordinasyonu, konuşma. |
+```mermaid
+sequenceDiagram
+    participant B2BUA
+    participant MQ as RabbitMQ
+    participant WF as Workflow Engine
+    participant DB as Postgres (Rules)
+    participant Media
+    participant Agent
 
-**Kural:** Agent Service asla kendi başına "Ben şimdi ne yapayım?" diye karar vermez. Workflow ona "Sahneye Çık" diyene kadar bekler.
+    B2BUA->>MQ: call.started (To: 8001)
+    MQ->>WF: Event Ingest
+    
+    WF->>DB: Get Workflow for "8001"
+    DB-->>WF: JSON: { step1: "PlayWelcome", step2: "ConnectAgent" }
+    
+    Note over WF: Adım 1: Karşılama
+    WF->>Media: PlayAudio("welcome.wav")
+    
+    Media-->>MQ: playback.finished
+    MQ->>WF: Event Ingest
+    
+    Note over WF: Adım 2: Ajan Bağlama
+    WF->>Agent: StartConversation(Context)
+```
+
+## 3. JSON Şema Yapısı
+
+```json
+{
+  "id": "wf_support",
+  "steps": {
+    "welcome": {
+      "type": "play",
+      "file": "intro.wav",
+      "next": "menu"
+    },
+    "menu": {
+      "type": "input_dtmf",
+      "timeout": 5,
+      "branches": {
+        "1": "sales_flow",
+        "2": "support_flow"
+      }
+    }
+  }
+}
+```
+
+---
