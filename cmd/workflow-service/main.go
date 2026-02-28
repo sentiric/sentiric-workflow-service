@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 
+	"github.com/sentiric/sentiric-workflow-service/internal/app"
 	"github.com/sentiric/sentiric-workflow-service/internal/config"
 	"github.com/sentiric/sentiric-workflow-service/internal/logger"
 )
@@ -16,6 +17,5 @@ func main() {
 	l := logger.New("workflow-service", cfg.Env, cfg.LogLevel)
 	l.Info().Msg("💠 Sentiric Workflow Service (The Cortex) başlatılıyor...")
 
-	// Uygulamayı başlat
-	// app.Run(cfg, l)
+	app.Run(cfg, l)
 }
