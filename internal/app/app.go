@@ -1,11 +1,18 @@
 package app
 
 import (
+	"context"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+
 	"github.com/rs/zerolog"
 	"github.com/sentiric/sentiric-workflow-service/internal/client"
 	"github.com/sentiric/sentiric-workflow-service/internal/config"
 	"github.com/sentiric/sentiric-workflow-service/internal/database"
 	"github.com/sentiric/sentiric-workflow-service/internal/engine"
+	"github.com/sentiric/sentiric-workflow-service/internal/event"
 )
 
 func Run(cfg *config.Config, log zerolog.Logger) {
@@ -31,15 +38,25 @@ func Run(cfg *config.Config, log zerolog.Logger) {
 	// 3. Engine (Beyin)
 	processor := engine.NewProcessor(redisClient.Client, clients, log)
 
-	// [DÜZELTME]: Değişkeni log içinde kullanarak hatayı giderdik.
-	log.Info().Msgf("⚙️ Workflow Processor hazırlandı. (Engine Address: %p)", processor)
+	// 4. RabbitMQ Listener (Olay Dinleyici)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// 4. RabbitMQ Listener (Placeholder)
-	log.Info().Msg("🐰 RabbitMQ Listener başlatılıyor (Placeholder)...")
+	var wg sync.WaitGroup
+	consumer := event.NewConsumer(processor, log)
+	if err := consumer.Start(ctx, cfg.RabbitMQURL, &wg); err != nil {
+		log.Fatal().Err(err).Msg("RabbitMQ Consumer başlatılamadı")
+	}
 
-	// Geliştirme aşamasında olduğumuz için şimdilik sonsuz döngüde bekletiyoruz.
 	log.Info().Msg("✅ Workflow Service Çalışıyor. Olay bekleniyor...")
 
-	// Block forever
-	select {}
+	// 5. Graceful Shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	log.Warn().Msg("Kapatma sinyali alındı. Servis durduruluyor...")
+	cancel()
+	wg.Wait()
+	log.Info().Msg("Servis güvenle kapatıldı.")
 }
