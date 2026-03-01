@@ -42,7 +42,7 @@ func NewClients(cfg *config.Config, log zerolog.Logger) (*GrpcClients, error) {
 		if err != nil {
 			log.Warn().Err(err).Msg("⚠️ Sertifikalar yüklenemedi, INSECURE moda düşülüyor.")
 		} else {
-			log.Info().Msg("🔐 mTLS Sertifikaları yüklendi.")
+			log.Info().Msg("🔐 mTLS Sertifikaları başarıyla yüklendi.")
 		}
 	} else {
 		log.Warn().Msg("⚠️ Sertifika yolları boş, INSECURE mod kullanılıyor.")
@@ -96,7 +96,9 @@ func connect(targetURL string, serverName string, tlsCreds credentials.Transport
 	// Eğer HTTPS ise ve sertifika varsa mTLS kullan
 	if isHttps && tlsCreds != nil {
 		opts = append(opts, grpc.WithTransportCredentials(tlsCreds))
-		// SNI (Server Name Indication) için Authority override
+		// SNI (Server Name Indication) için Authority override.
+		// Sertifikalar 'sentiric.cloud' veya servis adı üzerine olabilir.
+		// En güvenli yöntem serverName'i kullanmaktır.
 		opts = append(opts, grpc.WithAuthority(serverName))
 	} else {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
