@@ -2,11 +2,15 @@
 package client
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	// Contracts
@@ -27,22 +31,42 @@ type GrpcClients struct {
 }
 
 func NewClients(cfg *config.Config, log zerolog.Logger) (*GrpcClients, error) {
-	log.Info().Msg("🔌 Workflow Service istemcileri hazırlanıyor...")
+	log.Info().Msg("🔌 Workflow Service istemcileri (mTLS Destekli) hazırlanıyor...")
 
-	mediaConn, err := connect(cfg.MediaServiceURL)
+	// Sertifikaları Yükle
+	var tlsCreds credentials.TransportCredentials
+	var err error
+
+	if cfg.CertPath != "" && cfg.KeyPath != "" && cfg.CaPath != "" {
+		tlsCreds, err = loadClientTLS(cfg.CertPath, cfg.KeyPath, cfg.CaPath)
+		if err != nil {
+			log.Warn().Err(err).Msg("⚠️ Sertifikalar yüklenemedi, INSECURE moda düşülüyor.")
+		} else {
+			log.Info().Msg("🔐 mTLS Sertifikaları yüklendi.")
+		}
+	} else {
+		log.Warn().Msg("⚠️ Sertifika yolları boş, INSECURE mod kullanılıyor.")
+	}
+
+	// 1. Media Service
+	mediaConn, err := connect(cfg.MediaServiceURL, "media-service", tlsCreds)
 	if err != nil {
 		return nil, fmt.Errorf("media service connect fail: %w", err)
 	}
 
-	agentConn, err := connect(cfg.AgentServiceURL)
+	// 2. Agent Service
+	agentConn, err := connect(cfg.AgentServiceURL, "agent-service", tlsCreds)
 	if err != nil {
 		return nil, fmt.Errorf("agent service connect fail: %w", err)
 	}
 
-	b2buaConn, err := connect(cfg.B2buaServiceURL)
+	// 3. B2BUA Service
+	b2buaConn, err := connect(cfg.B2buaServiceURL, "b2bua-service", tlsCreds)
 	if err != nil {
 		return nil, fmt.Errorf("b2bua service connect fail: %w", err)
 	}
+
+	log.Info().Msg("✅ Tüm gRPC istemcileri başarıyla bağlandı.")
 
 	return &GrpcClients{
 		Media: mediav1.NewMediaServiceClient(mediaConn),
@@ -58,13 +82,54 @@ func (c *GrpcClients) Close() {
 	}
 }
 
-func connect(targetURL string) (*grpc.ClientConn, error) {
-	// Basitlik için şu an INSECURE (mTLS ileride eklenebilir)
-	// URL temizleme
-	clean := strings.TrimPrefix(strings.TrimPrefix(targetURL, "http://"), "https://")
+func connect(targetURL string, serverName string, tlsCreds credentials.TransportCredentials) (*grpc.ClientConn, error) {
+	var opts []grpc.DialOption
 
-	return grpc.NewClient(
-		clean,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
+	// URL Sanitization
+	cleanTarget := targetURL
+	isHttps := strings.HasPrefix(targetURL, "https://")
+
+	for _, prefix := range []string{"https://", "http://"} {
+		cleanTarget = strings.TrimPrefix(cleanTarget, prefix)
+	}
+
+	// Eğer HTTPS ise ve sertifika varsa mTLS kullan
+	if isHttps && tlsCreds != nil {
+		opts = append(opts, grpc.WithTransportCredentials(tlsCreds))
+		// SNI (Server Name Indication) için Authority override
+		opts = append(opts, grpc.WithAuthority(serverName))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	// Bloklamayan bağlantı (Lazy connection)
+	return grpc.NewClient(cleanTarget, opts...)
+}
+
+func loadClientTLS(certPath, keyPath, caPath string) (credentials.TransportCredentials, error) {
+	// İstemci Sertifikası (Client Cert)
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("client cert load error: %w", err)
+	}
+
+	// CA Sertifikası (Root CA)
+	caPem, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, fmt.Errorf("CA cert load error: %w", err)
+	}
+
+	certPool := x509.NewCertPool()
+	if !certPool.AppendCertsFromPEM(caPem) {
+		return nil, fmt.Errorf("failed to append CA cert")
+	}
+
+	// TLS Config
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      certPool,
+		// InsecureSkipVerify: true, // PROD İÇİN ASLA AÇMA (Sadece debug)
+	}
+
+	return credentials.NewTLS(tlsConfig), nil
 }
