@@ -36,6 +36,7 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 		return
 	}
 
+	// [SUTS] Zengin log context
 	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
 	l.Info().Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor")
 
@@ -49,24 +50,31 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		return
 	}
 
+	// Context'e TraceID ekle
 	outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
 
 	l.Debug().Str("step", stepID).Str("type", step.Type).Msg("Adım işleniyor...")
 
-	// [NO-HARDCODE]: "record" parametresini artık dinamik olarak kontrol ediyoruz
+	// [KAYIT MANTIĞI]: actionData'dan kontrol et
 	if record, ok := actionData["record"]; ok && record == "true" {
 		l.Info().Msg("🎤 Kayıt talimatı algılandı. Media Service'e StartRecording komutu gönderiliyor...")
+
 		_, err := p.clients.Media.StartRecording(outCtx, &mediav1.StartRecordingRequest{
 			CallId:        callID,
-			TraceId:       traceID,
+			TraceId:       traceID, // [ZENGİNLEŞTİRME]
 			ServerRtpPort: rtpPort,
 			OutputUri:     fmt.Sprintf("s3://sentiric/recordings/%s.wav", callID),
 			SampleRate:    toUint32Ptr(8000),
 			Format:        toStringPtr("wav"),
 		})
+
 		if err != nil {
 			l.Error().Err(err).Msg("Media.StartRecording RPC çağrısı başarısız oldu.")
+		} else {
+			l.Info().Msg("✅ Kayıt başarıyla başlatıldı.")
 		}
+
+		// Tekrar tetiklenmemesi için sil
 		delete(actionData, "record")
 	}
 
@@ -87,10 +95,10 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 	case "handover_to_agent":
 		l.Info().Msg("🤖 Workflow: Çağrı Agent Service'e devrediliyor (Handover)...")
 
-		// Dialplan ID'yi ve diğer parametreleri actionData'dan dinamik olarak al
-		dialplanID, _ := actionData["dialplanId"] // default ""
-		if dialplanID == "" {
-			dialplanID = "DP_DEMO_AI_ASSISTANT" // Fallback
+		// Dialplan ID'yi actionData'dan al (Varsa)
+		dialplanID := "DP_DEMO_AI_ASSISTANT"
+		if dpID, ok := actionData["dialplan_id"]; ok && dpID != "" {
+			dialplanID = dpID
 		}
 
 		_, err := p.clients.Agent.ProcessCallStart(outCtx, &agentv1.ProcessCallStartRequest{
