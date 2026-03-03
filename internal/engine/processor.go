@@ -25,7 +25,6 @@ func NewProcessor(r *redis.Client, c *client.GrpcClients, l zerolog.Logger) *Pro
 	return &Processor{redis: r, clients: c, log: l}
 }
 
-// Helpers for Protobuf
 func toUint32Ptr(v uint32) *uint32 { return &v }
 func toStringPtr(v string) *string { return &v }
 
@@ -36,7 +35,6 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 		return
 	}
 
-	// [SUTS] Zengin log context
 	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
 	l.Info().Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor")
 
@@ -50,35 +48,43 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		return
 	}
 
-	// Context'e TraceID ekle
 	outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
-
 	l.Debug().Str("step", stepID).Str("type", step.Type).Msg("Adım işleniyor...")
 
-	// [KAYIT MANTIĞI]: actionData'dan kontrol et
 	if record, ok := actionData["record"]; ok && record == "true" {
 		l.Info().Msg("🎤 Kayıt talimatı algılandı. Media Service'e StartRecording komutu gönderiliyor...")
-
 		_, err := p.clients.Media.StartRecording(outCtx, &mediav1.StartRecordingRequest{
 			CallId:        callID,
-			TraceId:       traceID, // [ZENGİNLEŞTİRME]
+			TraceId:       traceID,
 			ServerRtpPort: rtpPort,
 			OutputUri:     fmt.Sprintf("s3://sentiric/recordings/%s.wav", callID),
 			SampleRate:    toUint32Ptr(8000),
 			Format:        toStringPtr("wav"),
 		})
-
 		if err != nil {
 			l.Error().Err(err).Msg("Media.StartRecording RPC çağrısı başarısız oldu.")
 		} else {
 			l.Info().Msg("✅ Kayıt başarıyla başlatıldı.")
 		}
-
-		// Tekrar tetiklenmemesi için sil
 		delete(actionData, "record")
 	}
 
 	switch step.Type {
+
+	// [YENİ]: EKSİK OLAN PLAY_AUDIO KOMUTU EKLENDİ
+	case "play_audio":
+		if file, ok := step.Params["file"]; ok {
+			l.Info().Str("file", file).Msg("🔊 Workflow: PlayAudio komutu gönderiliyor...")
+			_, err := p.clients.Media.PlayAudio(outCtx, &mediav1.PlayAudioRequest{
+				AudioUri:      fmt.Sprintf("file://%s", file),
+				ServerRtpPort: rtpPort,
+				RtpTargetAddr: rtpTarget,
+			})
+			if err != nil {
+				l.Error().Err(err).Msg("Media.PlayAudio RPC çağrısı başarısız oldu.")
+			}
+		}
+
 	case "execute_command":
 		if cmd, ok := step.Params["command"]; ok && cmd == "media.enable_echo" {
 			l.Info().Msg("🔊 Workflow: Echo Test komutu gönderiliyor...")
@@ -94,31 +100,24 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 
 	case "handover_to_agent":
 		l.Info().Msg("🤖 Workflow: Çağrı Agent Service'e devrediliyor (Handover)...")
-
-		// Dialplan ID'yi actionData'dan al (Varsa)
 		dialplanID := "DP_DEMO_AI_ASSISTANT"
 		if dpID, ok := actionData["dialplan_id"]; ok && dpID != "" {
 			dialplanID = dpID
 		}
-
 		_, err := p.clients.Agent.ProcessCallStart(outCtx, &agentv1.ProcessCallStartRequest{
 			CallId:     callID,
 			DialplanId: dialplanID,
 		})
-
 		if err != nil {
 			l.Error().Err(err).Msg("Agent.ProcessCallStart RPC çağrısı başarısız oldu.")
 		}
-
 		l.Info().Str("call_id", callID).Msg("✅ Workflow görevini tamamladı. Kontrol Agent'ta.")
 		return
 
 	case "wait":
-		// TODO: Redis tabanlı asenkron timer
 		time.Sleep(2 * time.Second)
 	}
 
-	// Sonraki adım varsa geç
 	if step.Next != "" {
 		p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, step.Next, wf, actionData)
 	} else {
