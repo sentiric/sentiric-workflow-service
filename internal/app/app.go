@@ -16,7 +16,6 @@ import (
 )
 
 func Run(cfg *config.Config, log zerolog.Logger) {
-	// 1. Veritabanı Bağlantıları
 	pgPool, err := database.NewPostgresConnection(cfg.PostgresURL, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Postgres connection failed")
@@ -28,17 +27,15 @@ func Run(cfg *config.Config, log zerolog.Logger) {
 		log.Fatal().Err(err).Msg("Redis connection failed")
 	}
 
-	// 2. Clients
 	clients, err := client.NewClients(cfg, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("gRPC Clients init failed")
 	}
 	defer clients.Close()
 
-	// 3. Engine (Beyin)
-	processor := engine.NewProcessor(redisClient.Client, clients, log)
+	// [DÜZELTME BURADA] pgPool parametresi eklendi
+	processor := engine.NewProcessor(redisClient.Client, pgPool, clients, log)
 
-	// 4. RabbitMQ Listener (Olay Dinleyici)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -50,7 +47,6 @@ func Run(cfg *config.Config, log zerolog.Logger) {
 
 	log.Info().Msg("✅ Workflow Service Çalışıyor. Olay bekleniyor...")
 
-	// 5. Graceful Shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan

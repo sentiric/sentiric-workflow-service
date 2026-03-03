@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool" // DB için eklendi
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	agentv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/agent/v1"
@@ -17,12 +18,14 @@ import (
 
 type Processor struct {
 	redis   *redis.Client
+	db      *pgxpool.Pool // [YENİ]: Veritabanı havuzu eklendi
 	clients *client.GrpcClients
 	log     zerolog.Logger
 }
 
-func NewProcessor(r *redis.Client, c *client.GrpcClients, l zerolog.Logger) *Processor {
-	return &Processor{redis: r, clients: c, log: l}
+// [DÜZELTME]: App.go'daki çağırma şekline uygun olarak DB eklendi
+func NewProcessor(r *redis.Client, db *pgxpool.Pool, c *client.GrpcClients, l zerolog.Logger) *Processor {
+	return &Processor{redis: r, db: db, clients: c, log: l}
 }
 
 func toUint32Ptr(v uint32) *uint32 { return &v }
@@ -38,6 +41,13 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
 	l.Info().Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor")
 
+	// [YENİ]: Session'ı Veritabanında Başlat
+	query := `
+		INSERT INTO workflow_sessions (call_id, workflow_id, current_step_id, status) 
+		VALUES ($1, $2, $3, 'RUNNING')
+		ON CONFLICT (session_id) DO NOTHING`
+	_, _ = p.db.Exec(context.Background(), query, callID, wf.ID, wf.StartNode)
+
 	p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, wf.StartNode, &wf, actionData)
 }
 
@@ -45,8 +55,12 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 	step, exists := wf.Steps[stepID]
 	if !exists {
 		l.Warn().Str("step", stepID).Msg("Step bulunamadı, akış durdu.")
+		_, _ = p.db.Exec(context.Background(), `UPDATE workflow_sessions SET status = 'ERROR', updated_at = NOW() WHERE call_id = $1`, callID)
 		return
 	}
+
+	// [YENİ]: Aktif adımı Veritabanında Güncelle
+	_, _ = p.db.Exec(context.Background(), `UPDATE workflow_sessions SET current_step_id = $1, updated_at = NOW() WHERE call_id = $2`, stepID, callID)
 
 	outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
 	l.Debug().Str("step", stepID).Str("type", step.Type).Msg("Adım işleniyor...")
@@ -70,8 +84,6 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 	}
 
 	switch step.Type {
-
-	// [YENİ]: EKSİK OLAN PLAY_AUDIO KOMUTU EKLENDİ
 	case "play_audio":
 		if file, ok := step.Params["file"]; ok {
 			l.Info().Str("file", file).Msg("🔊 Workflow: PlayAudio komutu gönderiliyor...")
@@ -111,16 +123,22 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		if err != nil {
 			l.Error().Err(err).Msg("Agent.ProcessCallStart RPC çağrısı başarısız oldu.")
 		}
+
+		_, _ = p.db.Exec(context.Background(), `UPDATE workflow_sessions SET status = 'HANDOVER_AGENT', updated_at = NOW() WHERE call_id = $1`, callID)
 		l.Info().Str("call_id", callID).Msg("✅ Workflow görevini tamamladı. Kontrol Agent'ta.")
 		return
 
 	case "wait":
 		time.Sleep(2 * time.Second)
+	case "hangup":
+		_, _ = p.db.Exec(context.Background(), `UPDATE workflow_sessions SET status = 'COMPLETED', updated_at = NOW() WHERE call_id = $1`, callID)
+		return
 	}
 
 	if step.Next != "" {
 		p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, step.Next, wf, actionData)
 	} else {
+		_, _ = p.db.Exec(context.Background(), `UPDATE workflow_sessions SET status = 'COMPLETED', updated_at = NOW() WHERE call_id = $1`, callID)
 		l.Info().Str("call_id", callID).Msg("✅ Workflow Tamamlandı.")
 	}
 }
