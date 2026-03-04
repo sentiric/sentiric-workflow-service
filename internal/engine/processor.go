@@ -33,8 +33,16 @@ func toStringPtr(v string) *string { return &v }
 
 func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, rtpPort uint32, rtpTarget string, workflowDefJSON string, actionData map[string]string) {
 	var wf Workflow
+	// [RESILIENCE UPDATE]: JSON hatası yakalandığında detaylı log bas.
 	if err := json.Unmarshal([]byte(workflowDefJSON), &wf); err != nil {
-		p.log.Error().Err(err).Str("call_id", callID).Msg("Workflow JSON parse hatası")
+		p.log.Error().
+			Err(err).
+			Str("call_id", callID).
+			Str("json_snippet", workflowDefJSON). // Hatalı JSON'u loga bas
+			Msg("❌ CRITICAL: Workflow JSON parse hatası! Akış başlatılamıyor.")
+
+		// Opsiyonel: Burada "Acil Durum Anonsu" çaldırılabilir veya çağrı sonlandırılabilir.
+		// p.clients.B2BUA.TerminateCall(...)
 		return
 	}
 
