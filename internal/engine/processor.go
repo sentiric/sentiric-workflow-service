@@ -7,24 +7,25 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	agentv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/agent/v1"
 	mediav1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/media/v1"
 	"github.com/sentiric/sentiric-workflow-service/internal/client"
+	"github.com/sentiric/sentiric-workflow-service/internal/repository" // YENİ
 	"google.golang.org/grpc/metadata"
 )
 
 type Processor struct {
 	redis   *redis.Client
-	db      *pgxpool.Pool
+	repo    *repository.WorkflowRepository // YENİ: Repository eklendi
 	clients *client.GrpcClients
 	log     zerolog.Logger
 }
 
-func NewProcessor(r *redis.Client, db *pgxpool.Pool, c *client.GrpcClients, l zerolog.Logger) *Processor {
-	return &Processor{redis: r, db: db, clients: c, log: l}
+// NewProcessor constructor güncellendi
+func NewProcessor(r *redis.Client, repo *repository.WorkflowRepository, c *client.GrpcClients, l zerolog.Logger) *Processor {
+	return &Processor{redis: r, repo: repo, clients: c, log: l}
 }
 
 func toUint32Ptr(v uint32) *uint32 { return &v }
@@ -38,24 +39,10 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 	}
 
 	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
-	l.Info().Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor")
+	l.Info().Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor (DB Backed)")
 
-	// [KRİTİK DÜZELTME]: Foreign Key hatasını önlemek için gelen JSON'u otomatik olarak workflows tablosuna Upsert yapıyoruz.
-	upsertQuery := `
-		INSERT INTO workflows (id, tenant_id, name, definition) 
-		VALUES ($1, 'system', $1, $2::jsonb) 
-		ON CONFLICT (id) DO UPDATE SET definition = EXCLUDED.definition`
-	_, err := p.db.Exec(context.Background(), upsertQuery, wf.ID, workflowDefJSON)
-	if err != nil {
-		l.Warn().Err(err).Msg("Workflow tanımı DB'ye kaydedilemedi, Foreign Key hatası alınabilir.")
-	}
-
-	// Artık güvenle Session oluşturabiliriz
-	sessionQuery := `
-		INSERT INTO workflow_sessions (call_id, workflow_id, current_step_id, status) 
-		VALUES ($1, $2, $3, 'RUNNING')
-		ON CONFLICT (session_id) DO NOTHING`
-	_, _ = p.db.Exec(context.Background(), sessionQuery, callID, wf.ID, wf.StartNode)
+	// 1. Session Oluştur (Repo üzerinden)
+	_ = p.repo.CreateSession(ctx, callID, wf.ID, wf.StartNode)
 
 	p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, wf.StartNode, &wf, actionData)
 }
@@ -64,15 +51,17 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 	step, exists := wf.Steps[stepID]
 	if !exists {
 		l.Warn().Str("step", stepID).Msg("Step bulunamadı, akış durdu.")
-		_, _ = p.db.Exec(context.Background(), `UPDATE workflow_sessions SET status = 'ERROR', updated_at = NOW() WHERE call_id = $1`, callID)
+		p.repo.UpdateSessionStatus(ctx, callID, "ERROR")
 		return
 	}
 
-	_, _ = p.db.Exec(context.Background(), `UPDATE workflow_sessions SET current_step_id = $1, updated_at = NOW() WHERE call_id = $2`, stepID, callID)
+	p.repo.UpdateSessionStep(ctx, callID, stepID)
 
 	outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
 	l.Debug().Str("step", stepID).Str("type", step.Type).Msg("Adım işleniyor...")
 
+	// Global Record Logic (Eğer actionData'da varsa, akışın başında başlat)
+	// Not: Bu logic normalde bir "Node" olmalı ama geriye dönük uyum için burada tutuyoruz.
 	if record, ok := actionData["record"]; ok && record == "true" {
 		l.Info().Msg("🎤 Kayıt talimatı algılandı. Media Service'e StartRecording komutu gönderiliyor...")
 		_, err := p.clients.Media.StartRecording(outCtx, &mediav1.StartRecordingRequest{
@@ -80,7 +69,7 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 			TraceId:       traceID,
 			ServerRtpPort: rtpPort,
 			OutputUri:     fmt.Sprintf("s3://sentiric/recordings/%s.wav", callID),
-			SampleRate:    toUint32Ptr(16000), // [FIX]: 16kHz olarak güncellendi
+			SampleRate:    toUint32Ptr(8000), // [FIX]: Telekom standardı 8kHz
 			Format:        toStringPtr("wav"),
 		})
 		if err != nil {
@@ -88,7 +77,7 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		} else {
 			l.Info().Msg("✅ Kayıt başarıyla başlatıldı.")
 		}
-		delete(actionData, "record")
+		delete(actionData, "record") // Tekrar tetiklenmesin
 	}
 
 	switch step.Type {
@@ -132,21 +121,23 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 			l.Error().Err(err).Msg("Agent.ProcessCallStart RPC çağrısı başarısız oldu.")
 		}
 
-		_, _ = p.db.Exec(context.Background(), `UPDATE workflow_sessions SET status = 'HANDOVER_AGENT', updated_at = NOW() WHERE call_id = $1`, callID)
+		p.repo.UpdateSessionStatus(ctx, callID, "HANDOVER_AGENT")
 		l.Info().Str("call_id", callID).Msg("✅ Workflow görevini tamamladı. Kontrol Agent'ta.")
 		return
 
 	case "wait":
 		time.Sleep(2 * time.Second)
 	case "hangup":
-		_, _ = p.db.Exec(context.Background(), `UPDATE workflow_sessions SET status = 'COMPLETED', updated_at = NOW() WHERE call_id = $1`, callID)
+		p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
+		// Burada B2BUA.TerminateCall çağrılabilir ama akış bitince B2BUA zaten zaman aşımına uğrayabilir
+		// Veya explicit terminate eklenebilir.
 		return
 	}
 
 	if step.Next != "" {
 		p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, step.Next, wf, actionData)
 	} else {
-		_, _ = p.db.Exec(context.Background(), `UPDATE workflow_sessions SET status = 'COMPLETED', updated_at = NOW() WHERE call_id = $1`, callID)
+		p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
 		l.Info().Str("call_id", callID).Msg("✅ Workflow Tamamlandı.")
 	}
 }

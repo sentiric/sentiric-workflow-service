@@ -11,6 +11,7 @@ import (
 
 	eventv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/event/v1"
 	"github.com/sentiric/sentiric-workflow-service/internal/engine"
+	"github.com/sentiric/sentiric-workflow-service/internal/repository" // YENİ
 )
 
 const (
@@ -20,12 +21,15 @@ const (
 
 type Consumer struct {
 	processor *engine.Processor
+	repo      *repository.WorkflowRepository // YENİ: Repo erişimi
 	log       zerolog.Logger
 }
 
-func NewConsumer(processor *engine.Processor, log zerolog.Logger) *Consumer {
+// Constructor güncellendi
+func NewConsumer(processor *engine.Processor, repo *repository.WorkflowRepository, log zerolog.Logger) *Consumer {
 	return &Consumer{
 		processor: processor,
+		repo:      repo,
 		log:       log,
 	}
 }
@@ -96,7 +100,6 @@ func (c *Consumer) handleMessage(ctx context.Context, d amqp091.Delivery) {
 		return
 	}
 
-	// [SUTS] Zenginleştirilmiş Log Context'i Oluştur
 	l := c.log.With().
 		Str("trace_id", callStarted.TraceId).
 		Str("call_id", callStarted.CallId).
@@ -112,55 +115,43 @@ func (c *Consumer) handleMessage(ctx context.Context, d amqp091.Delivery) {
 		return
 	}
 
-	// [NO-HARDCODE]: Gerçek Dialplan Definition'ını al
+	// [AKILLI WORKFLOW YÖNETİMİ]
 	dialplanDef, ok := res.Action.ActionData["definition"]
+
 	if !ok || dialplanDef == "" {
-		// Eğer dialplan içinde definition yoksa, eski mock mantığına geri dön (güvenlik için)
-		l.Warn().
-			Str("dialplan_id", res.DialplanId).
-			Msg("⚠️ Dialplan'den 'definition' JSON'u gelmedi. Geriye dönük uyumluluk (mock) modu kullanılıyor.")
-		dialplanDef = c.generateMockWorkflow(res.Action.Action)
+		// Payload içinde JSON yoksa, DB'den bulmaya çalış
+		actionType := res.Action.Action // Örn: ECHO_TEST
+		targetWfID := repository.MapActionToWorkflowID(actionType)
+
+		if targetWfID != "" {
+			l.Info().Str("wf_id", targetWfID).Msg("📂 Veritabanından Workflow tanımı yükleniyor...")
+			if def, err := c.repo.GetWorkflowDefinition(ctx, targetWfID); err == nil {
+				dialplanDef = def
+			} else {
+				l.Error().Err(err).Str("wf_id", targetWfID).Msg("❌ Workflow DB'de bulunamadı!")
+				// Fallback: Acil durum mock'u (Servisin çökmemesi için)
+				dialplanDef = `{"id": "wf_fallback", "start_node": "end", "steps": {"end": {"type": "hangup"}}}`
+			}
+		} else {
+			// Eğer Mapping yoksa (Örn: BRIDGE_CALL), bu bir "Aksiyon"dur, Workflow değildir.
+			// Workflow servisi burada devreden çıkmalıdır.
+			l.Info().Str("action", actionType).Msg("ℹ️ Bu aksiyon tipi için Workflow tanımı gerekmiyor.")
+			return
+		}
 	}
 
 	l.Info().
 		Str("tenant_id", res.TenantId).
 		Str("dialplan_id", res.DialplanId).
-		Msg("📞 Yeni çağrı yakalandı. Dialplan'den gelen dinamik Workflow başlatılıyor...")
+		Msg("📞 Workflow Motoru tetikleniyor...")
 
-	// [KRİTİK DÜZELTME]: Tüm gerekli parametreler artık gönderiliyor
 	c.processor.StartWorkflow(
 		ctx,
 		callStarted.CallId,
 		callStarted.TraceId,
 		callStarted.GetMediaInfo().GetServerRtpPort(),
 		callStarted.GetMediaInfo().GetCallerRtpAddr(),
-		dialplanDef, // Artık dinamik
+		dialplanDef,
 		res.Action.ActionData,
 	)
-}
-
-// generateMockWorkflow artık sadece bir Geriye Dönük Uyumluluk (Fallback) mekanizmasıdır.
-func (c *Consumer) generateMockWorkflow(actionType string) string {
-	if actionType == "ECHO_TEST" || actionType == "ACTION_TYPE_ECHO_TEST" {
-		return `{
-			"id": "wf_echo_mock",
-			"start_node": "step_echo",
-			"steps": {
-				"step_echo": { "type": "execute_command", "params": { "command": "media.enable_echo" }, "next": "step_wait" },
-				"step_wait": { "type": "wait", "params": { "duration_seconds": "60" } }
-			}
-		}`
-	}
-
-	if actionType == "START_AI_CONVERSATION" || actionType == "ACTION_TYPE_START_AI_CONVERSATION" {
-		return `{
-			"id": "wf_ai_mock",
-			"start_node": "step_handoff",
-			"steps": {
-				"step_handoff": { "type": "handover_to_agent", "params": { "mode": "duplex" } }
-			}
-		}`
-	}
-
-	return `{"id": "wf_empty", "start_node": "end", "steps": { "end": { "type": "hangup" } }}`
 }

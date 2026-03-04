@@ -1,3 +1,4 @@
+// sentiric-workflow-service/internal/app/app.go
 package app
 
 import (
@@ -13,6 +14,7 @@ import (
 	"github.com/sentiric/sentiric-workflow-service/internal/database"
 	"github.com/sentiric/sentiric-workflow-service/internal/engine"
 	"github.com/sentiric/sentiric-workflow-service/internal/event"
+	"github.com/sentiric/sentiric-workflow-service/internal/repository" // YENİ
 )
 
 func Run(cfg *config.Config, log zerolog.Logger) {
@@ -33,19 +35,24 @@ func Run(cfg *config.Config, log zerolog.Logger) {
 	}
 	defer clients.Close()
 
-	// [DÜZELTME BURADA] pgPool parametresi eklendi
-	processor := engine.NewProcessor(redisClient.Client, pgPool, clients, log)
+	// [YENİ]: Repository Katmanı
+	repo := repository.NewWorkflowRepository(pgPool, log)
+
+	// [GÜNCELLEME]: Processor artık repo kullanıyor
+	processor := engine.NewProcessor(redisClient.Client, repo, clients, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var wg sync.WaitGroup
-	consumer := event.NewConsumer(processor, log)
+	// [GÜNCELLEME]: Consumer artık repo kullanıyor
+	consumer := event.NewConsumer(processor, repo, log)
+
 	if err := consumer.Start(ctx, cfg.RabbitMQURL, &wg); err != nil {
 		log.Fatal().Err(err).Msg("RabbitMQ Consumer başlatılamadı")
 	}
 
-	log.Info().Msg("✅ Workflow Service Çalışıyor. Olay bekleniyor...")
+	log.Info().Msg("✅ Workflow Service Çalışıyor (DB Integrated). Olay bekleniyor...")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
