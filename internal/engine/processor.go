@@ -34,24 +34,29 @@ func toStringPtr(v string) *string { return &v }
 
 func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, rtpPort uint32, rtpTarget string, workflowDefJSON string, actionData map[string]string) {
 	var wf Workflow
-	// [RESILIENCE UPDATE]: JSON hatası yakalandığında detaylı log bas.
 	if err := json.Unmarshal([]byte(workflowDefJSON), &wf); err != nil {
-		p.log.Error().
-			Err(err).
-			Str("call_id", callID).
-			Str("json_snippet", workflowDefJSON). // Hatalı JSON'u loga bas
-			Msg("❌ CRITICAL: Workflow JSON parse hatası! Akış başlatılamıyor.")
-
+		p.log.Error().Err(err).Msg("❌ Workflow JSON parse hatası")
 		// Opsiyonel: Burada "Acil Durum Anonsu" çaldırılabilir veya çağrı sonlandırılabilir.
 		// p.clients.B2BUA.TerminateCall(...)
 		return
 	}
 
-	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
-	l.Info().Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor (DB Backed)")
+	// [SAĞLAMLAŞTIRMA]: Eğer JSON içinde ID yoksa, actionData'dan veya varsayılan bir ID ata.
+	if wf.ID == "" {
+		if id, ok := actionData["workflow_id"]; ok {
+			wf.ID = id
+		} else {
+			wf.ID = "wf_unknown" // Fallback to avoid FK error
+		}
+	}
 
-	// 1. Session Oluştur (Repo üzerinden)
-	_ = p.repo.CreateSession(ctx, callID, wf.ID, wf.StartNode)
+	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
+	l.Info().Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor")
+
+	// Session oluştururken hata alırsak logla ama AKIŞI DURDURMA (Soft-Fail)
+	if err := p.repo.CreateSession(ctx, callID, wf.ID, wf.StartNode); err != nil {
+		l.Warn().Err(err).Msg("⚠️ Session DB'ye kaydedilemedi ama akış devam ediyor.")
+	}
 
 	p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, wf.StartNode, &wf, actionData)
 }
