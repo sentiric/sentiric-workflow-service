@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -134,7 +135,16 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		return
 
 	case "wait":
-		time.Sleep(2 * time.Second)
+		// [DÜZELTME]: JSON'dan süreyi dinamik oku, yoksa 2 saniye bekle.
+		durationSecs := 2
+		if dsStr, ok := step.Params["duration_seconds"]; ok {
+			if parsed, err := strconv.Atoi(dsStr); err == nil {
+				durationSecs = parsed
+			}
+		}
+		l.Info().Int("seconds", durationSecs).Msg("⏳ Workflow belirtilen süre kadar bekletiliyor...")
+		time.Sleep(time.Duration(durationSecs) * time.Second)
+
 	case "hangup":
 		p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
 		// Burada B2BUA.TerminateCall çağrılabilir ama akış bitince B2BUA zaten zaman aşımına uğrayabilir
