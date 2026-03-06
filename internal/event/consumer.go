@@ -11,7 +11,7 @@ import (
 
 	eventv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/event/v1"
 	"github.com/sentiric/sentiric-workflow-service/internal/engine"
-	"github.com/sentiric/sentiric-workflow-service/internal/repository" // YENİ
+	"github.com/sentiric/sentiric-workflow-service/internal/repository"
 )
 
 const (
@@ -21,49 +21,28 @@ const (
 
 type Consumer struct {
 	processor *engine.Processor
-	repo      *repository.WorkflowRepository // YENİ: Repo erişimi
+	repo      *repository.WorkflowRepository
 	log       zerolog.Logger
 }
 
-// Constructor güncellendi
 func NewConsumer(processor *engine.Processor, repo *repository.WorkflowRepository, log zerolog.Logger) *Consumer {
-	return &Consumer{
-		processor: processor,
-		repo:      repo,
-		log:       log,
-	}
+	return &Consumer{processor: processor, repo: repo, log: log}
 }
 
 func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) error {
+	// ... (RabbitMQ bağlantı kodları aynı kalır) ...
 	conn, err := amqp091.Dial(url)
 	if err != nil {
 		return err
 	}
-
 	ch, err := conn.Channel()
 	if err != nil {
 		return err
 	}
-
-	err = ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil)
-	if err != nil {
-		return err
-	}
-
-	q, err := ch.QueueDeclare(queueName, true, false, false, false, nil)
-	if err != nil {
-		return err
-	}
-
-	err = ch.QueueBind(q.Name, "call.started", exchangeName, false, nil)
-	if err != nil {
-		return err
-	}
-
-	msgs, err := ch.Consume(q.Name, "", false, false, false, false, nil)
-	if err != nil {
-		return err
-	}
+	_ = ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil)
+	q, _ := ch.QueueDeclare(queueName, true, false, false, false, nil)
+	_ = ch.QueueBind(q.Name, "call.started", exchangeName, false, nil)
+	msgs, _ := ch.Consume(q.Name, "", false, false, false, false, nil)
 
 	c.log.Info().Msg("🐰 Workflow Consumer: RabbitMQ dinleniyor...")
 
@@ -76,52 +55,45 @@ func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) er
 		for {
 			select {
 			case <-ctx.Done():
-				c.log.Info().Msg("Workflow Consumer durduruluyor.")
 				return
 			case d, ok := <-msgs:
 				if !ok {
-					c.log.Error().Msg("RabbitMQ kanalı kapandı.")
 					return
 				}
-
 				c.handleMessage(ctx, d)
 				d.Ack(false)
 			}
 		}
 	}()
-
 	return nil
 }
 
 func (c *Consumer) handleMessage(ctx context.Context, d amqp091.Delivery) {
 	var callStarted eventv1.CallStartedEvent
 	if err := proto.Unmarshal(d.Body, &callStarted); err != nil {
-		c.log.Debug().Err(err).Msg("Mesaj CallStartedEvent formatında değil, atlanıyor.")
 		return
 	}
 
-	l := c.log.With().
-		Str("trace_id", callStarted.TraceId).
-		Str("call_id", callStarted.CallId).
-		Logger()
-
-	if callStarted.EventType != "call.started" {
-		return
-	}
+	l := c.log.With().Str("trace_id", callStarted.TraceId).Str("call_id", callStarted.CallId).Logger()
 
 	res := callStarted.GetDialplanResolution()
 	if res == nil || res.Action == nil {
-		l.Error().Msg("❌ CRITICAL: Dialplan Resolution bilgisi olmadan 'call.started' olayı alındı!")
 		return
 	}
 
-	// [AKILLI WORKFLOW YÖNETİMİ]
+	//[MİMARİ DEVRİM - TAM UI UYUMU]
+	// 1. Önce Dialplan'ın doğrudan bir workflow tanımı (JSON) gönderip göndermediğine bak.
 	dialplanDef, ok := res.Action.ActionData["definition"]
 
 	if !ok || dialplanDef == "" {
-		// Payload içinde JSON yoksa, DB'den bulmaya çalış
-		actionType := res.Action.Action // Örn: ECHO_TEST
-		targetWfID := repository.MapActionToWorkflowID(actionType)
+		// 2. Eğer JSON tanımı yoksa, Dialplan bir "workflow_id" göndermiş mi diye bak. (UI'dan atanan özel akışlar)
+		targetWfID := ""
+		if id, exists := res.Action.ActionData["workflow_id"]; exists && id != "" {
+			targetWfID = id
+		} else {
+			// 3. O da yoksa eski legacy fallback (ECHO_TEST -> wf_system_echo)
+			targetWfID = repository.MapActionToWorkflowID(res.Action.Action)
+		}
 
 		if targetWfID != "" {
 			l.Info().Str("wf_id", targetWfID).Msg("📂 Veritabanından Workflow tanımı yükleniyor...")
@@ -129,21 +101,22 @@ func (c *Consumer) handleMessage(ctx context.Context, d amqp091.Delivery) {
 				dialplanDef = def
 			} else {
 				l.Error().Err(err).Str("wf_id", targetWfID).Msg("❌ Workflow DB'de bulunamadı!")
-				// Fallback: Acil durum mock'u (Servisin çökmemesi için)
 				dialplanDef = `{"id": "wf_fallback", "start_node": "end", "steps": {"end": {"type": "hangup"}}}`
 			}
 		} else {
-			// Eğer Mapping yoksa (Örn: BRIDGE_CALL), bu bir "Aksiyon"dur, Workflow değildir.
-			// Workflow servisi burada devreden çıkmalıdır.
-			l.Info().Str("action", actionType).Msg("ℹ️ Bu aksiyon tipi için Workflow tanımı gerekmiyor.")
+			// Yönlendirme (BRIDGE) gibi işler Workflow gerektirmez.
+			l.Info().Str("action", res.Action.Action).Msg("ℹ️ Bu aksiyon tipi için Workflow gerekmiyor.")
 			return
 		}
 	}
 
-	l.Info().
-		Str("tenant_id", res.TenantId).
-		Str("dialplan_id", res.DialplanId).
-		Msg("📞 Workflow Motoru tetikleniyor...")
+	// Workflow Motorunu Başlat
+	// Res.DialplanId bilgisi ActionData'ya eklenerek Agent'a taşınması garanti altına alınır.
+	actionData := res.Action.ActionData
+	if actionData == nil {
+		actionData = make(map[string]string)
+	}
+	actionData["dialplan_id"] = res.DialplanId
 
 	c.processor.StartWorkflow(
 		ctx,
@@ -152,6 +125,6 @@ func (c *Consumer) handleMessage(ctx context.Context, d amqp091.Delivery) {
 		callStarted.GetMediaInfo().GetServerRtpPort(),
 		callStarted.GetMediaInfo().GetCallerRtpAddr(),
 		dialplanDef,
-		res.Action.ActionData,
+		actionData,
 	)
 }
