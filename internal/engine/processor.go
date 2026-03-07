@@ -8,25 +8,26 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/rabbitmq/amqp091-go" // [DÜZELTME]: Import buraya taşındı
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	agentv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/agent/v1"
 	mediav1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/media/v1"
 	"github.com/sentiric/sentiric-workflow-service/internal/client"
-	"github.com/sentiric/sentiric-workflow-service/internal/repository" // YENİ
+	"github.com/sentiric/sentiric-workflow-service/internal/repository"
 	"google.golang.org/grpc/metadata"
 )
 
 type Processor struct {
-	redis   *redis.Client
-	repo    *repository.WorkflowRepository // YENİ: Repository eklendi
-	clients *client.GrpcClients
-	log     zerolog.Logger
+	redis     *redis.Client
+	repo      *repository.WorkflowRepository
+	clients   *client.GrpcClients
+	log       zerolog.Logger
+	rabbitURL string
 }
 
-// NewProcessor constructor güncellendi
-func NewProcessor(r *redis.Client, repo *repository.WorkflowRepository, c *client.GrpcClients, l zerolog.Logger) *Processor {
-	return &Processor{redis: r, repo: repo, clients: c, log: l}
+func NewProcessor(r *redis.Client, repo *repository.WorkflowRepository, c *client.GrpcClients, rabbitURL string, l zerolog.Logger) *Processor {
+	return &Processor{redis: r, repo: repo, clients: c, rabbitURL: rabbitURL, log: l}
 }
 
 func toUint32Ptr(v uint32) *uint32 { return &v }
@@ -36,24 +37,20 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 	var wf Workflow
 	if err := json.Unmarshal([]byte(workflowDefJSON), &wf); err != nil {
 		p.log.Error().Err(err).Msg("❌ Workflow JSON parse hatası")
-		// Opsiyonel: Burada "Acil Durum Anonsu" çaldırılabilir veya çağrı sonlandırılabilir.
-		// p.clients.B2BUA.TerminateCall(...)
 		return
 	}
 
-	// [SAĞLAMLAŞTIRMA]: Eğer JSON içinde ID yoksa, actionData'dan veya varsayılan bir ID ata.
 	if wf.ID == "" {
 		if id, ok := actionData["workflow_id"]; ok {
 			wf.ID = id
 		} else {
-			wf.ID = "wf_unknown" // Fallback to avoid FK error
+			wf.ID = "wf_unknown"
 		}
 	}
 
 	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
 	l.Info().Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor")
 
-	// Session oluştururken hata alırsak logla ama AKIŞI DURDURMA (Soft-Fail)
 	if err := p.repo.CreateSession(ctx, callID, wf.ID, wf.StartNode); err != nil {
 		l.Warn().Err(err).Msg("⚠️ Session DB'ye kaydedilemedi ama akış devam ediyor.")
 	}
@@ -74,8 +71,6 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 	outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
 	l.Debug().Str("step", stepID).Str("type", step.Type).Msg("Adım işleniyor...")
 
-	// Global Record Logic (Eğer actionData'da varsa, akışın başında başlat)
-	// Not: Bu logic normalde bir "Node" olmalı ama geriye dönük uyum için burada tutuyoruz.
 	if record, ok := actionData["record"]; ok && record == "true" {
 		l.Info().Msg("🎤 Kayıt talimatı algılandı. Media Service'e StartRecording komutu gönderiliyor...")
 		_, err := p.clients.Media.StartRecording(outCtx, &mediav1.StartRecordingRequest{
@@ -83,7 +78,7 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 			TraceId:       traceID,
 			ServerRtpPort: rtpPort,
 			OutputUri:     fmt.Sprintf("s3://sentiric/recordings/%s.wav", callID),
-			SampleRate:    toUint32Ptr(8000), // [FIX]: Telekom standardı 8kHz
+			SampleRate:    toUint32Ptr(8000),
 			Format:        toStringPtr("wav"),
 		})
 		if err != nil {
@@ -91,7 +86,7 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		} else {
 			l.Info().Msg("✅ Kayıt başarıyla başlatıldı.")
 		}
-		delete(actionData, "record") // Tekrar tetiklenmesin
+		delete(actionData, "record")
 	}
 
 	switch step.Type {
@@ -140,7 +135,6 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		return
 
 	case "wait":
-		// [DÜZELTME]: JSON'dan süreyi dinamik oku, yoksa 2 saniye bekle.
 		durationSecs := 2
 		if dsStr, ok := step.Params["duration_seconds"]; ok {
 			if parsed, err := strconv.Atoi(dsStr); err == nil {
@@ -152,8 +146,23 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 
 	case "hangup":
 		p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
-		// Burada B2BUA.TerminateCall çağrılabilir ama akış bitince B2BUA zaten zaman aşımına uğrayabilir
-		// Veya explicit terminate eklenebilir.
+		l.Info().Str("call_id", callID).Msg("🛑 Workflow: Hangup komutu alındı. Sonlandırma sinyali gönderiliyor.")
+
+		// [DÜZELTME]: amqp091 importu yukarıda olduğu için sorunsuz çalışır.
+		go func(rUrl, cid string) {
+			conn, err := amqp091.Dial(rUrl)
+			if err == nil {
+				defer conn.Close()
+				if ch, err := conn.Channel(); err == nil {
+					defer ch.Close()
+					payload := fmt.Sprintf(`{"callId":"%s","reason":"workflow_hangup"}`, cid)
+					_ = ch.PublishWithContext(context.Background(), "sentiric_events", "call.terminate.request", false, false, amqp091.Publishing{
+						ContentType: "application/json",
+						Body:        []byte(payload),
+					})
+				}
+			}
+		}(p.rabbitURL, callID)
 		return
 	}
 

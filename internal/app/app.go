@@ -14,7 +14,7 @@ import (
 	"github.com/sentiric/sentiric-workflow-service/internal/database"
 	"github.com/sentiric/sentiric-workflow-service/internal/engine"
 	"github.com/sentiric/sentiric-workflow-service/internal/event"
-	"github.com/sentiric/sentiric-workflow-service/internal/repository" // YENİ
+	"github.com/sentiric/sentiric-workflow-service/internal/repository"
 )
 
 func Run(cfg *config.Config, log zerolog.Logger) {
@@ -35,17 +35,15 @@ func Run(cfg *config.Config, log zerolog.Logger) {
 	}
 	defer clients.Close()
 
-	// [YENİ]: Repository Katmanı
 	repo := repository.NewWorkflowRepository(pgPool, log)
 
-	// [GÜNCELLEME]: Processor artık repo kullanıyor
-	processor := engine.NewProcessor(redisClient.Client, repo, clients, log)
+	// [DÜZELTME]: Processor'a RabbitMQ URL'i geçildi
+	processor := engine.NewProcessor(redisClient.Client, repo, clients, cfg.RabbitMQURL, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var wg sync.WaitGroup
-	// [GÜNCELLEME]: Consumer artık repo kullanıyor
 	consumer := event.NewConsumer(processor, repo, log)
 
 	if err := consumer.Start(ctx, cfg.RabbitMQURL, &wg); err != nil {
