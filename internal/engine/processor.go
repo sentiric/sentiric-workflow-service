@@ -93,13 +93,16 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 	case "play_audio":
 		if file, ok := step.Params["file"]; ok {
 			l.Info().Str("file", file).Msg("🔊 Workflow: PlayAudio komutu gönderiliyor...")
+
 			_, err := p.clients.Media.PlayAudio(outCtx, &mediav1.PlayAudioRequest{
 				AudioUri:      fmt.Sprintf("file://%s", file),
 				ServerRtpPort: rtpPort,
 				RtpTargetAddr: rtpTarget,
 			})
+
 			if err != nil {
-				l.Error().Err(err).Msg("Media.PlayAudio RPC çağrısı başarısız oldu.")
+				// [YENİ]: Error yerine Warn. Çünkü kullanıcı telefonu kapatıp gitmiş olabilir.
+				l.Warn().Err(err).Msg("Media.PlayAudio çağrısı başarısız oldu (Arama sonlanmış olabilir).")
 			}
 		}
 
