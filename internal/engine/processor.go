@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rabbitmq/amqp091-go" // [DÜZELTME]: Import buraya taşındı
@@ -125,12 +126,63 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		if dpID, ok := actionData["dialplan_id"]; ok && dpID != "" {
 			dialplanID = dpID
 		}
-		_, err := p.clients.Agent.ProcessCallStart(outCtx, &agentv1.ProcessCallStartRequest{
-			CallId:     callID,
-			DialplanId: dialplanID,
-		})
+
+		// =====================================================================
+		// [CRITICAL FIX]: DISTRIBUTED RACE CONDITION GUARD
+		// B2BUA'dan gelen RabbitMQ mesajının Agent Service tarafından işlenip
+		// Redis'e yazılması 50-100ms sürebilir. Workflow çok hızlı olduğu için
+		// gRPC isteği NotFound dönebilir. Burada akıllı bir Retry kurguluyoruz.
+		// =====================================================================
+		var err error
+		maxRetries := 5
+
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			_, err = p.clients.Agent.ProcessCallStart(outCtx, &agentv1.ProcessCallStartRequest{
+				CallId:     callID,
+				DialplanId: dialplanID,
+			})
+
+			if err == nil {
+				if attempt > 1 {
+					l.Info().Int("attempt", attempt).Msg("✅ Agent state hazır oldu, Handover başarılı.")
+				}
+				break // Başarılı, döngüden çık.
+			}
+
+			// Eğer hata NotFound ise (Yani Redis State henüz oluşmadıysa) bekle ve tekrar dene
+			if strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "not found") {
+				l.Warn().
+					Int("attempt", attempt).
+					Int("max_retries", maxRetries).
+					Msg("⏳ Agent state henüz Redis'e yazılmamış. 150ms bekleniyor... (Race Condition Guard)")
+
+				time.Sleep(time.Millisecond * 150)
+				continue
+			} else {
+				// Başka bir teknik hata varsa (örn: Bağlantı koptu) boşuna bekleme
+				break
+			}
+		}
+
 		if err != nil {
-			l.Error().Err(err).Msg("Agent.ProcessCallStart RPC çağrısı başarısız oldu.")
+			l.Error().Err(err).Msg("❌ CRITICAL: Agent.ProcessCallStart tüm denemelere rağmen başarısız oldu!")
+			p.repo.UpdateSessionStatus(ctx, callID, "ERROR")
+			// Çağrıyı asılı bırakmamak için Failsafe Hangup tetikliyoruz
+			go func(rUrl, cid string) {
+				conn, _ := amqp091.Dial(rUrl)
+				if conn != nil {
+					defer conn.Close()
+					if ch, _ := conn.Channel(); ch != nil {
+						defer ch.Close()
+						payload := fmt.Sprintf(`{"callId":"%s","reason":"system_terminated"}`, cid)
+						_ = ch.PublishWithContext(context.Background(), "sentiric_events", "call.terminate.request", false, false, amqp091.Publishing{
+							ContentType: "application/json",
+							Body:        []byte(payload),
+						})
+					}
+				}
+			}(p.rabbitURL, callID)
+			return
 		}
 
 		p.repo.UpdateSessionStatus(ctx, callID, "HANDOVER_AGENT")
