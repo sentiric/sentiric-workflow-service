@@ -35,9 +35,10 @@ func Run(cfg *config.Config, log zerolog.Logger) {
 	}
 	defer clients.Close()
 
-	repo := repository.NewWorkflowRepository(pgPool, log)
+	// [DÜZELTME]: Repository artık Redis client'ı da alıyor.
+	repo := repository.NewWorkflowRepository(pgPool, redisClient.Client, log)
 
-	// [DÜZELTME]: Processor'a RabbitMQ URL'i geçildi
+	// Processor'a repo iletiliyor
 	processor := engine.NewProcessor(redisClient.Client, repo, clients, cfg.RabbitMQURL, log)
 
 	ctx, cancel := context.WithCancel(context.Background())

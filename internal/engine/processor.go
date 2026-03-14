@@ -67,7 +67,7 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		return
 	}
 
-	p.repo.UpdateSessionStep(ctx, callID, stepID)
+	p.repo.UpdateSessionStep(ctx, callID, stepID) // Bu çağrı artık arka planda Redis'e yazar.
 
 	outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
 	l.Debug().Str("step", stepID).Str("type", step.Type).Msg("Adım işleniyor...")
