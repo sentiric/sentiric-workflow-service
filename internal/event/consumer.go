@@ -1,4 +1,4 @@
-// sentiric-workflow-service/internal/event/consumer.go
+// File: internal/event/consumer.go
 package event
 
 import (
@@ -30,7 +30,6 @@ func NewConsumer(processor *engine.Processor, repo *repository.WorkflowRepositor
 }
 
 func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) error {
-	// ... (RabbitMQ bağlantı kodları aynı kalır) ...
 	conn, err := amqp091.Dial(url)
 	if err != nil {
 		return err
@@ -41,10 +40,15 @@ func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) er
 	}
 	_ = ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil)
 	q, _ := ch.QueueDeclare(queueName, true, false, false, false, nil)
+
+	// EVENT DRIFT FIX: Spec dosyasındaki eksik eventler eklendi
 	_ = ch.QueueBind(q.Name, "call.started", exchangeName, false, nil)
+	_ = ch.QueueBind(q.Name, "call.media.playback.finished", exchangeName, false, nil)
+	_ = ch.QueueBind(q.Name, "call.ended", exchangeName, false, nil)
+
 	msgs, _ := ch.Consume(q.Name, "", false, false, false, false, nil)
 
-	c.log.Info().Msg("🐰 Workflow Consumer: RabbitMQ dinleniyor...")
+	c.log.Info().Msg("🐰 Workflow Consumer: Olaylar Dinleniyor (started, playback, ended)...")
 
 	wg.Add(1)
 	go func() {
@@ -60,7 +64,7 @@ func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) er
 				if !ok {
 					return
 				}
-				c.handleMessage(ctx, d)
+				c.routeMessage(ctx, d)
 				d.Ack(false)
 			}
 		}
@@ -68,9 +72,40 @@ func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) er
 	return nil
 }
 
-func (c *Consumer) handleMessage(ctx context.Context, d amqp091.Delivery) {
+func (c *Consumer) routeMessage(ctx context.Context, d amqp091.Delivery) {
+	switch d.RoutingKey {
+	case "call.started":
+		c.handleCallStarted(ctx, d.Body)
+	case "call.media.playback.finished":
+		c.handlePlaybackFinished(ctx, d.Body)
+	case "call.ended":
+		c.handleCallEnded(ctx, d.Body)
+	default:
+		c.log.Debug().Str("routing_key", d.RoutingKey).Msg("İlgilenilmeyen event geldi, geçiliyor.")
+	}
+}
+
+func (c *Consumer) handlePlaybackFinished(ctx context.Context, body []byte) {
+	var event eventv1.GenericEvent
+	if err := proto.Unmarshal(body, &event); err != nil {
+		return
+	}
+	c.log.Info().Str("call_id", event.TraceId).Msg("▶️ Playback bitti. Asenkron akış devam ettiriliyor...")
+	c.processor.ResumeWorkflow(ctx, event.TraceId, "playback_finished")
+}
+
+func (c *Consumer) handleCallEnded(ctx context.Context, body []byte) {
+	var event eventv1.CallEndedEvent
+	if err := proto.Unmarshal(body, &event); err != nil {
+		return
+	}
+	c.log.Info().Str("call_id", event.CallId).Msg("📞 Çağrı sonlandı. Oturum kapatılıyor.")
+	c.repo.UpdateSessionStatus(ctx, event.CallId, "COMPLETED")
+}
+
+func (c *Consumer) handleCallStarted(ctx context.Context, body []byte) {
 	var callStarted eventv1.CallStartedEvent
-	if err := proto.Unmarshal(d.Body, &callStarted); err != nil {
+	if err := proto.Unmarshal(body, &callStarted); err != nil {
 		return
 	}
 
@@ -81,17 +116,12 @@ func (c *Consumer) handleMessage(ctx context.Context, d amqp091.Delivery) {
 		return
 	}
 
-	//[MİMARİ DEVRİM - TAM UI UYUMU]
-	// 1. Önce Dialplan'ın doğrudan bir workflow tanımı (JSON) gönderip göndermediğine bak.
 	dialplanDef, ok := res.Action.ActionData["definition"]
-
 	if !ok || dialplanDef == "" {
-		// 2. Eğer JSON tanımı yoksa, Dialplan bir "workflow_id" göndermiş mi diye bak. (UI'dan atanan özel akışlar)
 		targetWfID := ""
 		if id, exists := res.Action.ActionData["workflow_id"]; exists && id != "" {
 			targetWfID = id
 		} else {
-			// 3. O da yoksa eski legacy fallback (ECHO_TEST -> wf_system_echo)
 			targetWfID = repository.MapActionToWorkflowID(res.Action.Action)
 		}
 
@@ -104,14 +134,10 @@ func (c *Consumer) handleMessage(ctx context.Context, d amqp091.Delivery) {
 				dialplanDef = `{"id": "wf_fallback", "start_node": "end", "steps": {"end": {"type": "hangup"}}}`
 			}
 		} else {
-			// Yönlendirme (BRIDGE) gibi işler Workflow gerektirmez.
-			l.Info().Str("action", res.Action.Action).Msg("ℹ️ Bu aksiyon tipi için Workflow gerekmiyor.")
 			return
 		}
 	}
 
-	// Workflow Motorunu Başlat
-	// Res.DialplanId bilgisi ActionData'ya eklenerek Agent'a taşınması garanti altına alınır.
 	actionData := res.Action.ActionData
 	if actionData == nil {
 		actionData = make(map[string]string)

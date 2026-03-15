@@ -1,4 +1,4 @@
-// sentiric-workflow-service/internal/engine/processor.go
+// File: internal/engine/processor.go
 package engine
 
 import (
@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rabbitmq/amqp091-go" // [DÜZELTME]: Import buraya taşındı
+	"github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	agentv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/agent/v1"
@@ -52,11 +52,50 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
 	l.Info().Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor")
 
-	if err := p.repo.CreateSession(ctx, callID, wf.ID, wf.StartNode); err != nil {
-		l.Warn().Err(err).Msg("⚠️ Session DB'ye kaydedilemedi ama akış devam ediyor.")
+	if err := p.repo.CreateSession(ctx, callID, wf.ID, wf.StartNode, traceID, rtpPort, rtpTarget); err != nil {
+		l.Warn().Err(err).Msg("⚠️ Session DB'ye kaydedilemedi.")
+		return // Session yoksa asenkron devam edemeyiz
 	}
 
 	p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, wf.StartNode, &wf, actionData)
+}
+
+func (p *Processor) ResumeWorkflow(ctx context.Context, callID, trigger string) {
+	session, err := p.repo.GetSession(ctx, callID)
+	if err != nil {
+		p.log.Warn().Str("call_id", callID).Msg("Session bulunamadığı için akış devam ettirilemedi.")
+		return
+	}
+
+	if session["status"] != "RUNNING" {
+		p.log.Debug().Str("call_id", callID).Msg("Session RUNNING değil, Resume iptal edildi.")
+		return
+	}
+
+	wfJSON, err := p.repo.GetWorkflowDefinition(ctx, session["workflow_id"])
+	if err != nil {
+		return
+	}
+
+	var wf Workflow
+	if err := json.Unmarshal([]byte(wfJSON), &wf); err != nil {
+		return
+	}
+
+	currentStep, exists := wf.Steps[session["current_step"]]
+	if !exists || currentStep.Next == "" {
+		p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
+		return
+	}
+
+	traceID := session["trace_id"]
+	rtpPort, _ := strconv.ParseUint(session["rtp_port"], 10, 32)
+	rtpTarget := session["rtp_target"]
+
+	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
+	l.Info().Str("trigger", trigger).Str("next_step", currentStep.Next).Msg("♻️ Akış Resume edildi.")
+
+	p.executeStep(ctx, l, callID, traceID, uint32(rtpPort), rtpTarget, currentStep.Next, &wf, nil)
 }
 
 func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, traceID string, rtpPort uint32, rtpTarget string, stepID string, wf *Workflow, actionData map[string]string) {
@@ -67,43 +106,26 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		return
 	}
 
-	p.repo.UpdateSessionStep(ctx, callID, stepID) // Bu çağrı artık arka planda Redis'e yazar.
+	p.repo.UpdateSessionStep(ctx, callID, stepID)
 
 	outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
 	l.Debug().Str("step", stepID).Str("type", step.Type).Msg("Adım işleniyor...")
 
-	if record, ok := actionData["record"]; ok && record == "true" {
-		l.Info().Msg("🎤 Kayıt talimatı algılandı. Media Service'e StartRecording komutu gönderiliyor...")
-		_, err := p.clients.Media.StartRecording(outCtx, &mediav1.StartRecordingRequest{
-			CallId:        callID,
-			TraceId:       traceID,
-			ServerRtpPort: rtpPort,
-			OutputUri:     fmt.Sprintf("s3://sentiric/recordings/%s.wav", callID),
-			SampleRate:    toUint32Ptr(8000),
-			Format:        toStringPtr("wav"),
-		})
-		if err != nil {
-			l.Error().Err(err).Msg("Media.StartRecording RPC çağrısı başarısız oldu.")
-		} else {
-			l.Info().Msg("✅ Kayıt başarıyla başlatıldı.")
-		}
-		delete(actionData, "record")
-	}
+	isAsync := false // Bu komut rabbitMQ asenkron eventi tetikleyecek mi?
 
 	switch step.Type {
 	case "play_audio":
+		isAsync = true // Media play işlemi bittiğinde "call.media.playback.finished" MQ'dan gelecek
 		if file, ok := step.Params["file"]; ok {
-			l.Info().Str("file", file).Msg("🔊 Workflow: PlayAudio komutu gönderiliyor...")
-
+			l.Info().Str("file", file).Msg("🔊 PlayAudio gönderiliyor (Asenkron bitiş bekleniyor)...")
 			_, err := p.clients.Media.PlayAudio(outCtx, &mediav1.PlayAudioRequest{
 				AudioUri:      fmt.Sprintf("file://%s", file),
 				ServerRtpPort: rtpPort,
 				RtpTargetAddr: rtpTarget,
 			})
-
 			if err != nil {
-				// [YENİ]: Error yerine Warn. Çünkü kullanıcı telefonu kapatıp gitmiş olabilir.
-				l.Warn().Err(err).Msg("Media.PlayAudio çağrısı başarısız oldu (Arama sonlanmış olabilir).")
+				l.Warn().Err(err).Msg("Media.PlayAudio başarısız.")
+				isAsync = false // Hata aldıysa bekleme, geç
 			}
 		}
 
@@ -116,58 +138,37 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 				RtpTargetAddr: rtpTarget,
 			})
 			if err != nil {
-				l.Error().Err(err).Msg("Media.PlayAudio (Echo) RPC çağrısı başarısız oldu.")
+				l.Error().Err(err).Msg("Media.PlayAudio (Echo) başarısız oldu.")
 			}
 		}
 
 	case "handover_to_agent":
-		l.Info().Msg("🤖 Workflow: Çağrı Agent Service'e devrediliyor (Handover)...")
+		l.Info().Msg("🤖 Çağrı Agent Service'e devrediliyor (Handover)...")
 		dialplanID := "DP_DEMO_AI_ASSISTANT"
-		if dpID, ok := actionData["dialplan_id"]; ok && dpID != "" {
-			dialplanID = dpID
+		if actionData != nil {
+			if dpID, ok := actionData["dialplan_id"]; ok && dpID != "" {
+				dialplanID = dpID
+			}
 		}
 
-		// =====================================================================
-		// [CRITICAL FIX]: DISTRIBUTED RACE CONDITION GUARD
-		// B2BUA'dan gelen RabbitMQ mesajının Agent Service tarafından işlenip
-		// Redis'e yazılması 50-100ms sürebilir. Workflow çok hızlı olduğu için
-		// gRPC isteği NotFound dönebilir. Burada akıllı bir Retry kurguluyoruz.
-		// =====================================================================
 		var err error
-		maxRetries := 5
-
-		for attempt := 1; attempt <= maxRetries; attempt++ {
+		for attempt := 1; attempt <= 5; attempt++ {
 			_, err = p.clients.Agent.ProcessCallStart(outCtx, &agentv1.ProcessCallStartRequest{
 				CallId:     callID,
 				DialplanId: dialplanID,
 			})
-
 			if err == nil {
-				if attempt > 1 {
-					l.Info().Int("attempt", attempt).Msg("✅ Agent state hazır oldu, Handover başarılı.")
-				}
-				break // Başarılı, döngüden çık.
-			}
-
-			// Eğer hata NotFound ise (Yani Redis State henüz oluşmadıysa) bekle ve tekrar dene
-			if strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "not found") {
-				l.Warn().
-					Int("attempt", attempt).
-					Int("max_retries", maxRetries).
-					Msg("⏳ Agent state henüz Redis'e yazılmamış. 150ms bekleniyor... (Race Condition Guard)")
-
-				time.Sleep(time.Millisecond * 150)
-				continue
-			} else {
-				// Başka bir teknik hata varsa (örn: Bağlantı koptu) boşuna bekleme
 				break
 			}
+			if strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "not found") {
+				time.Sleep(time.Millisecond * 150)
+				continue
+			}
+			break
 		}
 
 		if err != nil {
-			l.Error().Err(err).Msg("❌ CRITICAL: Agent.ProcessCallStart tüm denemelere rağmen başarısız oldu!")
 			p.repo.UpdateSessionStatus(ctx, callID, "ERROR")
-			// Çağrıyı asılı bırakmamak için Failsafe Hangup tetikliyoruz
 			go func(rUrl, cid string) {
 				conn, _ := amqp091.Dial(rUrl)
 				if conn != nil {
@@ -186,7 +187,7 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		}
 
 		p.repo.UpdateSessionStatus(ctx, callID, "HANDOVER_AGENT")
-		l.Info().Str("call_id", callID).Msg("✅ Workflow görevini tamamladı. Kontrol Agent'ta.")
+		l.Info().Str("call_id", callID).Msg("✅ Kontrol Agent'ta.")
 		return
 
 	case "wait":
@@ -196,14 +197,13 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 				durationSecs = parsed
 			}
 		}
-		l.Info().Int("seconds", durationSecs).Msg("⏳ Workflow belirtilen süre kadar bekletiliyor...")
+		l.Info().Int("seconds", durationSecs).Msg("⏳ Workflow bekletiliyor...")
 		time.Sleep(time.Duration(durationSecs) * time.Second)
 
 	case "hangup":
 		p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
-		l.Info().Str("call_id", callID).Msg("🛑 Workflow: Hangup komutu alındı. Sonlandırma sinyali gönderiliyor.")
+		l.Info().Str("call_id", callID).Msg("🛑 Hangup komutu alındı.")
 
-		// [DÜZELTME]: amqp091 importu yukarıda olduğu için sorunsuz çalışır.
 		go func(rUrl, cid string) {
 			conn, err := amqp091.Dial(rUrl)
 			if err == nil {
@@ -221,10 +221,16 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		return
 	}
 
-	if step.Next != "" {
-		p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, step.Next, wf, actionData)
+	// Eğer asenkron beklemiyorsa, sonraki adıma HIZLICA GEÇ.
+	// Asenkron bekliyorsa (Play Audio vb.) return yap, ResumeWorkflow tetiklenmesini bekle.
+	if !isAsync {
+		if step.Next != "" {
+			p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, step.Next, wf, actionData)
+		} else {
+			p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
+			l.Info().Str("call_id", callID).Msg("✅ Workflow Tamamlandı.")
+		}
 	} else {
-		p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
-		l.Info().Str("call_id", callID).Msg("✅ Workflow Tamamlandı.")
+		l.Info().Msg("⏸️ Workflow asenkron olayı (RabbitMQ) beklemek üzere RAM'den bırakıldı...")
 	}
 }

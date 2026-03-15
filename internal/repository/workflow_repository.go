@@ -1,8 +1,8 @@
+// File: internal/repository/workflow_repository.go
 package repository
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -23,7 +23,6 @@ func NewWorkflowRepository(db *pgxpool.Pool, rds *redis.Client, log zerolog.Logg
 	return &WorkflowRepository{db: db, redis: rds, log: log}
 }
 
-// GetWorkflowDefinition: Veritabanından (Postgres) iş akış şemasını getirir.
 func (r *WorkflowRepository) GetWorkflowDefinition(ctx context.Context, workflowID string) (string, error) {
 	var definition []byte
 	query := `SELECT definition FROM workflows WHERE id = $1 AND is_active = TRUE`
@@ -38,8 +37,6 @@ func (r *WorkflowRepository) GetWorkflowDefinition(ctx context.Context, workflow
 	return string(definition), nil
 }
 
-// MapActionToWorkflowID: Aksiyon tipine göre varsayılan workflow ID'sini döndürür.
-// [FIX]: Build hatasını önlemek için bu fonksiyon buraya geri eklendi.
 func MapActionToWorkflowID(actionType string) string {
 	switch actionType {
 	case "ECHO_TEST", "ACTION_TYPE_ECHO_TEST":
@@ -51,69 +48,66 @@ func MapActionToWorkflowID(actionType string) string {
 	}
 }
 
-// --- OTURUM YÖNETİMİ (REDIS TABANLI) ---
+// --- ATOMIC STATE MANAGEMENT (REDIS HASH) ---
 
-// CreateSession: Yeni bir çağrı oturumu oluşturur. Veriyi JSON string olarak saklar.
-func (r *WorkflowRepository) CreateSession(ctx context.Context, callID, workflowID, startNode string) error {
+func (r *WorkflowRepository) CreateSession(ctx context.Context, callID, workflowID, startNode, traceID string, rtpPort uint32, rtpTarget string) error {
 	key := fmt.Sprintf("wf_session:%s", callID)
-	sessionData := map[string]interface{}{
+
+	// HSet ile Race-Condition riski olmadan Atomik yazma
+	err := r.redis.HSet(ctx, key, map[string]interface{}{
 		"call_id":      callID,
 		"workflow_id":  workflowID,
 		"current_step": startNode,
 		"status":       "RUNNING",
+		"trace_id":     traceID,
+		"rtp_port":     rtpPort,
+		"rtp_target":   rtpTarget,
 		"updated_at":   time.Now().Format(time.RFC3339),
-	}
+	}).Err()
 
-	jsonData, err := json.Marshal(sessionData)
 	if err != nil {
+		r.log.Error().Err(err).Msg("❌ Redis HSet error during CreateSession")
 		return err
 	}
 
-	// 1 saatlik TTL ile Redis'e kaydet
-	return r.redis.Set(ctx, key, jsonData, time.Hour).Err()
+	// 1 Saatlik TTL
+	return r.redis.Expire(ctx, key, time.Hour).Err()
 }
 
-// UpdateSessionStep: Oturumun mevcut adımını günceller.
 func (r *WorkflowRepository) UpdateSessionStep(ctx context.Context, callID, stepID string) {
-	r.updateSessionField(ctx, callID, "current_step", stepID)
-}
-
-// UpdateSessionStatus: Oturumun durumunu günceller.
-func (r *WorkflowRepository) UpdateSessionStatus(ctx context.Context, callID, status string) {
-	r.updateSessionField(ctx, callID, "status", status)
-
-	// Eğer çağrı bittiyse TTL'i 5 dakikaya düşür (Clean-up)
-	if status == "COMPLETED" || status == "ERROR" {
-		r.redis.Expire(ctx, fmt.Sprintf("wf_session:%s", callID), 5*time.Minute)
-	}
-}
-
-// updateSessionField: Redis'teki JSON objesini güvenli şekilde güncelleyen yardımcı metod.
-func (r *WorkflowRepository) updateSessionField(ctx context.Context, callID, field, value string) {
 	key := fmt.Sprintf("wf_session:%s", callID)
-
-	// 1. Mevcut veriyi çek
-	val, err := r.redis.Get(ctx, key).Result()
-	if err != nil {
-		return // Session bulunamadıysa (timeout vb.) işlem yapma
-	}
-
-	// 2. Unmarshal et
-	var sessionData map[string]interface{}
-	if err := json.Unmarshal([]byte(val), &sessionData); err != nil {
-		return
-	}
-
-	// 3. Güncelle
-	sessionData[field] = value
-	sessionData["updated_at"] = time.Now().Format(time.RFC3339)
-
-	// 4. Tekrar kaydet (Marshal)
-	updatedJson, _ := json.Marshal(sessionData)
-	r.redis.Set(ctx, key, updatedJson, time.Hour)
+	r.redis.HSet(ctx, key, map[string]interface{}{
+		"current_step": stepID,
+		"updated_at":   time.Now().Format(time.RFC3339),
+	})
 }
 
-// UpsertWorkflow: Çalışma anında (runtime) workflow tanımı kaydetmek için (Postgres).
+func (r *WorkflowRepository) UpdateSessionStatus(ctx context.Context, callID, status string) {
+	key := fmt.Sprintf("wf_session:%s", callID)
+	r.redis.HSet(ctx, key, map[string]interface{}{
+		"status":     status,
+		"updated_at": time.Now().Format(time.RFC3339),
+	})
+
+	// Eğer tamamlandıysa hemen RAM'i temizle (5 dakika sonra düşür)
+	if status == "COMPLETED" || status == "ERROR" {
+		r.redis.Expire(ctx, key, 5*time.Minute)
+	}
+}
+
+// Yeni: Asenkron olaylar için oturum verisini çekme
+func (r *WorkflowRepository) GetSession(ctx context.Context, callID string) (map[string]string, error) {
+	key := fmt.Sprintf("wf_session:%s", callID)
+	session, err := r.redis.HGetAll(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(session) == 0 {
+		return nil, redis.Nil
+	}
+	return session, nil
+}
+
 func (r *WorkflowRepository) UpsertWorkflow(ctx context.Context, id, name, definition string) error {
 	query := `
 		INSERT INTO workflows (id, tenant_id, name, definition) 
