@@ -71,7 +71,6 @@ func (r *WorkflowRepository) CreateSession(ctx context.Context, callID, workflow
 		return err
 	}
 
-	// 1 Saatlik TTL
 	return r.redis.Expire(ctx, key, time.Hour).Err()
 }
 
@@ -85,46 +84,50 @@ func (r *WorkflowRepository) UpdateSessionStep(ctx context.Context, callID, step
 
 func (r *WorkflowRepository) UpdateSessionStatus(ctx context.Context, callID, status string) {
 	key := fmt.Sprintf("wf_session:%s", callID)
-	r.redis.HSet(ctx, key, map[string]interface{}{
-		"status":     status,
-		"updated_at": time.Now().Format(time.RFC3339),
-	})
 
-	// Eğer tamamlandıysa, hataya düştüyse veya agent'a devredildiyse (Terminal stateler)
+	// 1. Redis durumunu her zaman güncelle (Real-time izleme için)
+	r.redis.HSet(ctx, key, "status", status, "updated_at", time.Now().Format(time.RFC3339))
+
+	// 2. Terminal durum kontrolü (COMPLETED, ERROR, HANDOVER)
 	if status == "COMPLETED" || status == "ERROR" || status == "HANDOVER_AGENT" {
 
-		// 1. Redis'ten son durumu çek ve Postgres'e Audit Log olarak yaz
-		sessionData, err := r.GetSession(ctx, callID)
-		if err == nil && len(sessionData) > 0 {
-			wfID := sessionData["workflow_id"]
+		// [SRE IDEMPOTENCY LATCH]: Sadece bir kez PostgreSQL'e yazılmasını garanti et.
+		// 'is_archived' alanını sadece yoksa 'true' yapar.
+		isFirstTime, _ := r.redis.HSetNX(ctx, key, "is_archived", "true").Result()
 
-			// State'i JSONB olarak kaydetmek üzere serialize et
-			stateJSON, _ := json.Marshal(sessionData)
+		if isFirstTime {
+			// Yarışı bu thread kazandı, DB insert işlemini yapabilir.
+			sessionData, err := r.GetSession(ctx, callID)
+			if err == nil && len(sessionData) > 0 {
+				wfID := sessionData["workflow_id"]
+				stateJSON, _ := json.Marshal(sessionData)
 
-			// SQL Schema'sına uyması için status normalize ediliyor
-			dbStatus := status
-			if status == "ERROR" {
-				dbStatus = "FAILED"
+				dbStatus := status
+				if status == "ERROR" {
+					dbStatus = "FAILED"
+				}
+
+				query := `
+					INSERT INTO workflow_execution_logs (call_id, workflow_id, status, final_state_data) 
+					VALUES ($1, $2, $3, $4::jsonb)
+				`
+				_, dbErr := r.db.Exec(ctx, query, callID, wfID, dbStatus, stateJSON)
+				if dbErr != nil {
+					r.log.Error().Err(dbErr).Str("call_id", callID).Msg("❌ DB Write Fail")
+				} else {
+					r.log.Info().Str("call_id", callID).Msg("💾 Workflow Audit Log archived (First & Only trigger).")
+				}
 			}
-
-			query := `
-				INSERT INTO workflow_execution_logs (call_id, workflow_id, status, final_state_data) 
-				VALUES ($1, $2, $3, $4::jsonb)
-			`
-			_, dbErr := r.db.Exec(ctx, query, callID, wfID, dbStatus, stateJSON)
-			if dbErr != nil {
-				r.log.Error().Err(dbErr).Str("call_id", callID).Msg("❌ Workflow Execution Log veritabanına yazılamadı.")
-			} else {
-				r.log.Info().Str("call_id", callID).Str("status", dbStatus).Msg("💾 Workflow Audit Log PostgreSQL'e kalıcı olarak kaydedildi.")
-			}
+			// Bellek temizliği için TTL'i düşür
+			r.redis.Expire(ctx, key, 5*time.Minute)
+		} else {
+			// Daha önce başka bir trigger (örn: processor) tarafından yazılmış.
+			r.log.Debug().Str("call_id", callID).Msg("⏭️ Session already archived. Skipping duplicate DB insert.")
 		}
 
-		// 2. İşlem bittikten sonra Redis'teki RAM'i temizlemek üzere TTL'i kısalt (5 dakika)
-		r.redis.Expire(ctx, key, 5*time.Minute)
 	}
 }
 
-// Asenkron olaylar için oturum verisini çekme
 func (r *WorkflowRepository) GetSession(ctx context.Context, callID string) (map[string]string, error) {
 	key := fmt.Sprintf("wf_session:%s", callID)
 	session, err := r.redis.HGetAll(ctx, key).Result()
