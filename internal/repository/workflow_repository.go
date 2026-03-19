@@ -1,8 +1,9 @@
-// File: internal/repository/workflow_repository.go
+// Dosya: sentiric-workflow-service/internal/repository/workflow_repository.go
 package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -89,13 +90,41 @@ func (r *WorkflowRepository) UpdateSessionStatus(ctx context.Context, callID, st
 		"updated_at": time.Now().Format(time.RFC3339),
 	})
 
-	// Eğer tamamlandıysa hemen RAM'i temizle (5 dakika sonra düşür)
-	if status == "COMPLETED" || status == "ERROR" {
+	// Eğer tamamlandıysa, hataya düştüyse veya agent'a devredildiyse (Terminal stateler)
+	if status == "COMPLETED" || status == "ERROR" || status == "HANDOVER_AGENT" {
+
+		// 1. Redis'ten son durumu çek ve Postgres'e Audit Log olarak yaz
+		sessionData, err := r.GetSession(ctx, callID)
+		if err == nil && len(sessionData) > 0 {
+			wfID := sessionData["workflow_id"]
+
+			// State'i JSONB olarak kaydetmek üzere serialize et
+			stateJSON, _ := json.Marshal(sessionData)
+
+			// SQL Schema'sına uyması için status normalize ediliyor
+			dbStatus := status
+			if status == "ERROR" {
+				dbStatus = "FAILED"
+			}
+
+			query := `
+				INSERT INTO workflow_execution_logs (call_id, workflow_id, status, final_state_data) 
+				VALUES ($1, $2, $3, $4::jsonb)
+			`
+			_, dbErr := r.db.Exec(ctx, query, callID, wfID, dbStatus, stateJSON)
+			if dbErr != nil {
+				r.log.Error().Err(dbErr).Str("call_id", callID).Msg("❌ Workflow Execution Log veritabanına yazılamadı.")
+			} else {
+				r.log.Info().Str("call_id", callID).Str("status", dbStatus).Msg("💾 Workflow Audit Log PostgreSQL'e kalıcı olarak kaydedildi.")
+			}
+		}
+
+		// 2. İşlem bittikten sonra Redis'teki RAM'i temizlemek üzere TTL'i kısalt (5 dakika)
 		r.redis.Expire(ctx, key, 5*time.Minute)
 	}
 }
 
-// Yeni: Asenkron olaylar için oturum verisini çekme
+// Asenkron olaylar için oturum verisini çekme
 func (r *WorkflowRepository) GetSession(ctx context.Context, callID string) (map[string]string, error) {
 	key := fmt.Sprintf("wf_session:%s", callID)
 	session, err := r.redis.HGetAll(ctx, key).Result()
