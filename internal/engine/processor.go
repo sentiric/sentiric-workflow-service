@@ -1,4 +1,4 @@
-// File: internal/engine/processor.go
+// Dosya: sentiric-workflow-service/internal/engine/processor.go
 package engine
 
 import (
@@ -55,6 +55,26 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 	if err := p.repo.CreateSession(ctx, callID, wf.ID, wf.StartNode, traceID, rtpPort, rtpTarget); err != nil {
 		l.Warn().Err(err).Msg("⚠️ Session DB'ye kaydedilemedi.")
 		return // Session yoksa asenkron devam edemeyiz
+	}
+
+	// [ARCH-COMPLIANCE]: Evrensel Kayıt (Universal Recording) Tetikleyicisi
+	// AI veya Klasik IVR fark etmeksizin, çağrı kaydı burada başlatılır.
+	if rec, ok := actionData["record"]; ok && rec == "true" {
+		l.Info().Msg("🎙️ Çağrı kayıt izni tespit edildi. Media Service üzerinde kayıt başlatılıyor...")
+
+		outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
+		_, err := p.clients.Media.StartRecording(outCtx, &mediav1.StartRecordingRequest{
+			ServerRtpPort: rtpPort,
+			OutputUri:     "s3://sentiric/recordings", // Media service backend'i bu formatı klasöre çevirir
+			CallId:        callID,
+			TraceId:       traceID,
+		})
+
+		if err != nil {
+			l.Error().Err(err).Msg("❌ Media Service üzerinde kayıt başlatılamadı.")
+		} else {
+			l.Info().Msg("✅ Ses kaydı (RTP) başarıyla başlatıldı.")
+		}
 	}
 
 	p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, wf.StartNode, &wf, actionData)
