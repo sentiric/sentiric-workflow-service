@@ -134,19 +134,45 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 	isAsync := false // Bu komut rabbitMQ asenkron eventi tetikleyecek mi?
 
 	switch step.Type {
+
 	case "play_audio":
-		isAsync = true // Media play işlemi bittiğinde "call.media.playback.finished" MQ'dan gelecek
-		if file, ok := step.Params["file"]; ok {
-			l.Info().Str("file", file).Msg("🔊 PlayAudio gönderiliyor (Asenkron bitiş bekleniyor)...")
+		isAsync = true
+
+		// 1. Session'dan dil bilgisini al
+		lang := "tr" // default
+		if actionData != nil {
+			if l, ok := actionData["language"]; ok && l != "" {
+				lang = l
+			}
+		}
+
+		// 2. Dosya yolunu belirle
+		var audioFile string
+		if annID, ok := step.Params["announcement_id"]; ok {
+			tenantID := "system" // Session'dan alınabilir
+			if t, ok := actionData["tenant_id"]; ok {
+				tenantID = t
+			}
+
+			audioFile, _ = p.repo.GetAnnouncementPath(ctx, annID, tenantID, lang)
+		} else if file, ok := step.Params["file"]; ok {
+			audioFile = file // Geriye dönük uyumluluk
+		}
+
+		if audioFile != "" {
+			l.Info().Str("file", audioFile).Msg("🔊 PlayAudio gönderiliyor (Dinamik Çözümlendi)...")
 			_, err := p.clients.Media.PlayAudio(outCtx, &mediav1.PlayAudioRequest{
-				AudioUri:      fmt.Sprintf("file://%s", file),
+				AudioUri:      fmt.Sprintf("file://%s", audioFile),
 				ServerRtpPort: rtpPort,
 				RtpTargetAddr: rtpTarget,
 			})
 			if err != nil {
 				l.Warn().Err(err).Msg("Media.PlayAudio başarısız.")
-				isAsync = false // Hata aldıysa bekleme, geç
+				isAsync = false
 			}
+		} else {
+			l.Warn().Msg("⚠️ Çalınacak ses dosyası bulunamadı, adım atlanıyor.")
+			isAsync = false
 		}
 
 	case "execute_command":

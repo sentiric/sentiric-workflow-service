@@ -8,8 +8,8 @@ require (
 	github.com/rabbitmq/amqp091-go v1.10.0
 	github.com/redis/go-redis/v9 v9.5.1
 	github.com/rs/zerolog v1.34.0
-	// GÜNCELLEME: v1.18.0 (Tüm servislerle uyum için)
-	github.com/sentiric/sentiric-contracts v1.18.0
+	// GÜNCELLEME: v1.19.0 (language ayrıştırması)
+	github.com/sentiric/sentiric-contracts v1.19.0
 	google.golang.org/grpc v1.75.1
 	google.golang.org/protobuf v1.36.10
 )

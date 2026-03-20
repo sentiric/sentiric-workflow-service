@@ -148,3 +148,20 @@ func (r *WorkflowRepository) UpsertWorkflow(ctx context.Context, id, name, defin
 	_, err := r.db.Exec(ctx, query, id, name, definition)
 	return err
 }
+
+// GetAnnouncementPath, belirli bir dilde ve tenant'ta anons dosyasının yolunu DB'den çeker.
+func (r *WorkflowRepository) GetAnnouncementPath(ctx context.Context, annID, tenantID, langCode string) (string, error) {
+	var audioPath string
+	// Spesifik tenant'ı arar, bulamazsa 'system' tenant'ına (fallback) düşer.
+	query := `
+        SELECT audio_path FROM announcements
+        WHERE id = $1 AND language_code = $2 AND (tenant_id = $3 OR tenant_id = 'system')
+        ORDER BY tenant_id DESC LIMIT 1`
+
+	err := r.db.QueryRow(ctx, query, annID, langCode, tenantID).Scan(&audioPath)
+	if err != nil {
+		r.log.Error().Err(err).Str("ann_id", annID).Str("lang", langCode).Msg("Anons veritabanında bulunamadı!")
+		return "", err
+	}
+	return audioPath, nil
+}
