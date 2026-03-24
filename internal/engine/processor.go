@@ -31,9 +31,6 @@ func NewProcessor(r *redis.Client, repo *repository.WorkflowRepository, c *clien
 	return &Processor{redis: r, repo: repo, clients: c, rabbitURL: rabbitURL, log: l}
 }
 
-func toUint32Ptr(v uint32) *uint32 { return &v }
-func toStringPtr(v string) *string { return &v }
-
 func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, rtpPort uint32, rtpTarget string, workflowDefJSON string, actionData map[string]string) {
 	var wf Workflow
 	if err := json.Unmarshal([]byte(workflowDefJSON), &wf); err != nil {
@@ -54,18 +51,21 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 
 	if err := p.repo.CreateSession(ctx, callID, wf.ID, wf.StartNode, traceID, rtpPort, rtpTarget); err != nil {
 		l.Warn().Err(err).Msg("⚠️ Session DB'ye kaydedilemedi.")
-		return // Session yoksa asenkron devam edemeyiz
+		return
 	}
 
-	// [ARCH-COMPLIANCE]: Evrensel Kayıt (Universal Recording) Tetikleyicisi
-	// AI veya Klasik IVR fark etmeksizin, çağrı kaydı burada başlatılır.
 	if rec, ok := actionData["record"]; ok && rec == "true" {
 		l.Info().Msg("🎙️ Çağrı kayıt izni tespit edildi. Media Service üzerinde kayıt başlatılıyor...")
 
 		outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
-		_, err := p.clients.Media.StartRecording(outCtx, &mediav1.StartRecordingRequest{
+
+		// [ARCH-COMPLIANCE] constraints.yaml: timeouts kuralı gereği sonsuz bekleyen gRPC istekleri yasaklandı.
+		timeoutCtx, cancel := context.WithTimeout(outCtx, 5*time.Second)
+		defer cancel()
+
+		_, err := p.clients.Media.StartRecording(timeoutCtx, &mediav1.StartRecordingRequest{
 			ServerRtpPort: rtpPort,
-			OutputUri:     "s3://sentiric/recordings", // Media service backend'i bu formatı klasöre çevirir
+			OutputUri:     "s3://sentiric/recordings",
 			CallId:        callID,
 			TraceId:       traceID,
 		})
@@ -127,41 +127,41 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 	}
 
 	p.repo.UpdateSessionStep(ctx, callID, stepID)
-
 	outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
 	l.Debug().Str("step", stepID).Str("type", step.Type).Msg("Adım işleniyor...")
 
-	isAsync := false // Bu komut rabbitMQ asenkron eventi tetikleyecek mi?
+	isAsync := false
 
 	switch step.Type {
 
 	case "play_audio":
 		isAsync = true
-
-		// 1. Session'dan dil bilgisini al
-		lang := "tr" // default
+		lang := "tr"
 		if actionData != nil {
 			if l, ok := actionData["language"]; ok && l != "" {
 				lang = l
 			}
 		}
 
-		// 2. Dosya yolunu belirle
 		var audioFile string
 		if annID, ok := step.Params["announcement_id"]; ok {
-			tenantID := "system" // Session'dan alınabilir
+			tenantID := "system"
 			if t, ok := actionData["tenant_id"]; ok {
 				tenantID = t
 			}
-
 			audioFile, _ = p.repo.GetAnnouncementPath(ctx, annID, tenantID, lang)
 		} else if file, ok := step.Params["file"]; ok {
-			audioFile = file // Geriye dönük uyumluluk
+			audioFile = file
 		}
 
 		if audioFile != "" {
-			l.Info().Str("file", audioFile).Msg("🔊 PlayAudio gönderiliyor (Dinamik Çözümlendi)...")
-			_, err := p.clients.Media.PlayAudio(outCtx, &mediav1.PlayAudioRequest{
+			l.Info().Str("file", audioFile).Msg("🔊 PlayAudio gönderiliyor...")
+
+			// [ARCH-COMPLIANCE] timeouts kuralı
+			timeoutCtx, cancel := context.WithTimeout(outCtx, 5*time.Second)
+			defer cancel()
+
+			_, err := p.clients.Media.PlayAudio(timeoutCtx, &mediav1.PlayAudioRequest{
 				AudioUri:      fmt.Sprintf("file://%s", audioFile),
 				ServerRtpPort: rtpPort,
 				RtpTargetAddr: rtpTarget,
@@ -178,7 +178,12 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 	case "execute_command":
 		if cmd, ok := step.Params["command"]; ok && cmd == "media.enable_echo" {
 			l.Info().Msg("🔊 Workflow: Echo Test komutu gönderiliyor...")
-			_, err := p.clients.Media.PlayAudio(outCtx, &mediav1.PlayAudioRequest{
+
+			// [ARCH-COMPLIANCE] timeouts kuralı
+			timeoutCtx, cancel := context.WithTimeout(outCtx, 5*time.Second)
+			defer cancel()
+
+			_, err := p.clients.Media.PlayAudio(timeoutCtx, &mediav1.PlayAudioRequest{
 				AudioUri:      "control://enable_echo",
 				ServerRtpPort: rtpPort,
 				RtpTargetAddr: rtpTarget,
@@ -199,10 +204,14 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 
 		var err error
 		for attempt := 1; attempt <= 5; attempt++ {
-			_, err = p.clients.Agent.ProcessCallStart(outCtx, &agentv1.ProcessCallStartRequest{
+			// [ARCH-COMPLIANCE] timeouts kuralı
+			timeoutCtx, cancel := context.WithTimeout(outCtx, 5*time.Second)
+			_, err = p.clients.Agent.ProcessCallStart(timeoutCtx, &agentv1.ProcessCallStartRequest{
 				CallId:     callID,
 				DialplanId: dialplanID,
 			})
+			cancel() // Loop içinde defer yerine anında iptal
+
 			if err == nil {
 				break
 			}
@@ -267,8 +276,6 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		return
 	}
 
-	// Eğer asenkron beklemiyorsa, sonraki adıma HIZLICA GEÇ.
-	// Asenkron bekliyorsa (Play Audio vb.) return yap, ResumeWorkflow tetiklenmesini bekle.
 	if !isAsync {
 		if step.Next != "" {
 			p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, step.Next, wf, actionData)

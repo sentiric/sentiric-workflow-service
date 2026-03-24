@@ -1,4 +1,4 @@
-// File: internal/event/consumer.go
+// Dosya: sentiric-workflow-service/internal/event/consumer.go
 package event
 
 import (
@@ -17,6 +17,8 @@ import (
 const (
 	exchangeName = "sentiric_events"
 	queueName    = "sentiric.workflow_service.events"
+	dlxName      = "sentiric_events.failed"
+	dlqName      = "sentiric.workflow_service.failed"
 )
 
 type Consumer struct {
@@ -38,17 +40,27 @@ func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) er
 	if err != nil {
 		return err
 	}
-	_ = ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil)
-	q, _ := ch.QueueDeclare(queueName, true, false, false, false, nil)
 
-	// EVENT DRIFT FIX: Spec dosyasındaki eksik eventler eklendi
+	// [ARCH-COMPLIANCE] constraints.yaml: dead_letter_queue kuralı gereği DLX ve DLQ tanımlanır.
+	_ = ch.ExchangeDeclare(dlxName, "topic", true, false, false, false, nil)
+	_, _ = ch.QueueDeclare(dlqName, true, false, false, false, nil)
+	_ = ch.QueueBind(dlqName, "#", dlxName, false, nil)
+
+	_ = ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil)
+
+	// Ana kuyruğu DLX'e bağlıyoruz
+	args := amqp091.Table{
+		"x-dead-letter-exchange": dlxName,
+	}
+	q, _ := ch.QueueDeclare(queueName, true, false, false, false, args)
+
 	_ = ch.QueueBind(q.Name, "call.started", exchangeName, false, nil)
 	_ = ch.QueueBind(q.Name, "call.media.playback.finished", exchangeName, false, nil)
 	_ = ch.QueueBind(q.Name, "call.ended", exchangeName, false, nil)
 
 	msgs, _ := ch.Consume(q.Name, "", false, false, false, false, nil)
 
-	c.log.Info().Msg("🐰 Workflow Consumer: Olaylar Dinleniyor (started, playback, ended)...")
+	c.log.Info().Msg("🐰 Workflow Consumer: Olaylar Dinleniyor (SRE DLX Aktif)...")
 
 	wg.Add(1)
 	go func() {
@@ -64,8 +76,19 @@ func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) er
 				if !ok {
 					return
 				}
-				c.routeMessage(ctx, d)
-				d.Ack(false)
+
+				// [ARCH-COMPLIANCE] Panik durumunda sessiz mesaj kaybını önle, DLX'e at.
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							c.log.Error().Interface("panic", r).Msg("CRITICAL: Workflow mesajı işlerken panikledi. DLX'e atılıyor.")
+							_ = d.Nack(false, false)
+						}
+					}()
+
+					c.routeMessage(ctx, d)
+					_ = d.Ack(false)
+				}()
 			}
 		}
 	}()
