@@ -1,6 +1,7 @@
 // Dosya: sentiric-workflow-service/internal/engine/processor.go
 package engine
 
+// [ARCH-COMPLIANCE] RabbitMQ Payload'ları GenericEvent (Protobuf) formatında gönderilmeli.
 import (
 	"context"
 	"encoding/json"
@@ -12,8 +13,13 @@ import (
 	"github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
+
 	agentv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/agent/v1"
+	eventv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/event/v1"
 	mediav1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/media/v1"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/sentiric/sentiric-workflow-service/internal/client"
 	"github.com/sentiric/sentiric-workflow-service/internal/repository"
 	"google.golang.org/grpc/metadata"
@@ -222,20 +228,32 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		if err != nil {
 			p.repo.UpdateSessionStatus(ctx, callID, "ERROR")
 
-			// [ARCH-COMPLIANCE] Connection leak engellendi, shared AMQP pool kullanılıyor
-			go func(conn *amqp091.Connection, cid string) {
+			// [ARCH-COMPLIANCE] Connection leak engellendi, Payload Protobuf'a çevrildi
+			go func(conn *amqp091.Connection, cid string, reasonStr string) {
 				if conn == nil || conn.IsClosed() {
 					return
 				}
 				if ch, err := conn.Channel(); err == nil {
 					defer ch.Close()
-					payload := fmt.Sprintf(`{"callId":"%s","reason":"system_terminated"}`, cid)
+
+					payloadJSON := fmt.Sprintf(`{"callId":"%s","reason":"%s"}`, cid, reasonStr)
+
+					pbEvent := &eventv1.GenericEvent{
+						EventType:   "call.terminate.request",
+						TraceId:     cid,
+						Timestamp:   timestamppb.Now(),
+						TenantId:    "system",
+						PayloadJson: payloadJSON,
+					}
+
+					body, _ := proto.Marshal(pbEvent)
+
 					_ = ch.PublishWithContext(context.Background(), "sentiric_events", "call.terminate.request", false, false, amqp091.Publishing{
-						ContentType: "application/json",
-						Body:        []byte(payload),
+						ContentType: "application/protobuf",
+						Body:        body,
 					})
 				}
-			}(p.amqpConn, callID)
+			}(p.amqpConn, callID, "system_terminated") // "hangup" case'i için buraya "workflow_hangup" yazın.
 			return
 		}
 
@@ -257,20 +275,32 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
 		l.Info().Str("event", "WF_HANGUP_RECEIVED").Str("call_id", callID).Msg("🛑 Hangup komutu alındı.")
 
-		// [ARCH-COMPLIANCE] Connection leak engellendi, shared AMQP pool kullanılıyor
-		go func(conn *amqp091.Connection, cid string) {
+		// [ARCH-COMPLIANCE] Connection leak engellendi, Payload Protobuf'a çevrildi
+		go func(conn *amqp091.Connection, cid string, reasonStr string) {
 			if conn == nil || conn.IsClosed() {
 				return
 			}
 			if ch, err := conn.Channel(); err == nil {
 				defer ch.Close()
-				payload := fmt.Sprintf(`{"callId":"%s","reason":"workflow_hangup"}`, cid)
+
+				payloadJSON := fmt.Sprintf(`{"callId":"%s","reason":"%s"}`, cid, reasonStr)
+
+				pbEvent := &eventv1.GenericEvent{
+					EventType:   "call.terminate.request",
+					TraceId:     cid,
+					Timestamp:   timestamppb.Now(),
+					TenantId:    "system",
+					PayloadJson: payloadJSON,
+				}
+
+				body, _ := proto.Marshal(pbEvent)
+
 				_ = ch.PublishWithContext(context.Background(), "sentiric_events", "call.terminate.request", false, false, amqp091.Publishing{
-					ContentType: "application/json",
-					Body:        []byte(payload),
+					ContentType: "application/protobuf",
+					Body:        body,
 				})
 			}
-		}(p.amqpConn, callID)
+		}(p.amqpConn, callID, "workflow_hangup") // "hangup" case'i için buraya "workflow_hangup" yazın.
 		return
 	}
 
