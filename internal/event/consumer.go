@@ -31,24 +31,19 @@ func NewConsumer(processor *engine.Processor, repo *repository.WorkflowRepositor
 	return &Consumer{processor: processor, repo: repo, log: log}
 }
 
-func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) error {
-	conn, err := amqp091.Dial(url)
-	if err != nil {
-		return err
-	}
+func (c *Consumer) Start(ctx context.Context, conn *amqp091.Connection, wg *sync.WaitGroup) error {
 	ch, err := conn.Channel()
 	if err != nil {
 		return err
 	}
 
-	// [ARCH-COMPLIANCE] constraints.yaml: dead_letter_queue kuralı gereği DLX ve DLQ tanımlanır.
+	//[ARCH-COMPLIANCE] constraints.yaml: dead_letter_queue kuralı gereği DLX ve DLQ tanımlanır.
 	_ = ch.ExchangeDeclare(dlxName, "topic", true, false, false, false, nil)
 	_, _ = ch.QueueDeclare(dlqName, true, false, false, false, nil)
 	_ = ch.QueueBind(dlqName, "#", dlxName, false, nil)
 
 	_ = ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil)
 
-	// Ana kuyruğu DLX'e bağlıyoruz
 	args := amqp091.Table{
 		"x-dead-letter-exchange": dlxName,
 	}
@@ -60,13 +55,12 @@ func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) er
 
 	msgs, _ := ch.Consume(q.Name, "", false, false, false, false, nil)
 
-	c.log.Info().Msg("🐰 Workflow Consumer: Olaylar Dinleniyor (SRE DLX Aktif)...")
+	c.log.Info().Str("event", "AMQP_CONSUMER_STARTED").Msg("🐰 Workflow Consumer: Olaylar Dinleniyor (SRE DLX Aktif)...")
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer ch.Close()
-		defer conn.Close()
 
 		for {
 			select {
@@ -77,11 +71,10 @@ func (c *Consumer) Start(ctx context.Context, url string, wg *sync.WaitGroup) er
 					return
 				}
 
-				// [ARCH-COMPLIANCE] Panik durumunda sessiz mesaj kaybını önle, DLX'e at.
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
-							c.log.Error().Interface("panic", r).Msg("CRITICAL: Workflow mesajı işlerken panikledi. DLX'e atılıyor.")
+							c.log.Error().Str("event", "AMQP_MESSAGE_PANIC").Interface("panic", r).Msg("CRITICAL: Workflow mesajı işlerken panikledi. DLX'e atılıyor.")
 							_ = d.Nack(false, false)
 						}
 					}()

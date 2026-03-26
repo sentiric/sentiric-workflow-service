@@ -15,7 +15,8 @@ func main() {
 	}
 
 	l := logger.New("workflow-service", cfg.Env, cfg.LogLevel)
-	l.Info().Msg("💠 Sentiric Workflow Service (The Cortex) başlatılıyor...")
+	// [ARCH-COMPLIANCE] SUTS v4.0: Mandatory event key added.
+	l.Info().Str("event", "SERVICE_STARTING").Msg("💠 Sentiric Workflow Service (The Cortex) başlatılıyor...")
 
 	app.Run(cfg, l)
 }

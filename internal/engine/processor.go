@@ -20,21 +20,21 @@ import (
 )
 
 type Processor struct {
-	redis     *redis.Client
-	repo      *repository.WorkflowRepository
-	clients   *client.GrpcClients
-	log       zerolog.Logger
-	rabbitURL string
+	redis    *redis.Client
+	repo     *repository.WorkflowRepository
+	clients  *client.GrpcClients
+	log      zerolog.Logger
+	amqpConn *amqp091.Connection // [ARCH-COMPLIANCE] Shared AMQP Connection
 }
 
-func NewProcessor(r *redis.Client, repo *repository.WorkflowRepository, c *client.GrpcClients, rabbitURL string, l zerolog.Logger) *Processor {
-	return &Processor{redis: r, repo: repo, clients: c, rabbitURL: rabbitURL, log: l}
+func NewProcessor(r *redis.Client, repo *repository.WorkflowRepository, c *client.GrpcClients, amqpConn *amqp091.Connection, l zerolog.Logger) *Processor {
+	return &Processor{redis: r, repo: repo, clients: c, amqpConn: amqpConn, log: l}
 }
 
 func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, rtpPort uint32, rtpTarget string, workflowDefJSON string, actionData map[string]string) {
 	var wf Workflow
 	if err := json.Unmarshal([]byte(workflowDefJSON), &wf); err != nil {
-		p.log.Error().Err(err).Msg("❌ Workflow JSON parse hatası")
+		p.log.Error().Str("event", "WF_JSON_PARSE_ERROR").Err(err).Msg("❌ Workflow JSON parse hatası")
 		return
 	}
 
@@ -47,19 +47,19 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 	}
 
 	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
-	l.Info().Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor")
+	l.Info().Str("event", "WF_STARTING").Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor")
 
 	if err := p.repo.CreateSession(ctx, callID, wf.ID, wf.StartNode, traceID, rtpPort, rtpTarget); err != nil {
-		l.Warn().Err(err).Msg("⚠️ Session DB'ye kaydedilemedi.")
+		l.Warn().Str("event", "WF_SESSION_CREATE_FAIL").Err(err).Msg("⚠️ Session DB'ye kaydedilemedi.")
 		return
 	}
 
 	if rec, ok := actionData["record"]; ok && rec == "true" {
-		l.Info().Msg("🎙️ Çağrı kayıt izni tespit edildi. Media Service üzerinde kayıt başlatılıyor...")
+		l.Info().Str("event", "WF_RECORD_INIT").Msg("🎙️ Çağrı kayıt izni tespit edildi. Media Service üzerinde kayıt başlatılıyor...")
 
 		outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
 
-		// [ARCH-COMPLIANCE] constraints.yaml: timeouts kuralı gereği sonsuz bekleyen gRPC istekleri yasaklandı.
+		//[ARCH-COMPLIANCE] timeouts kuralı
 		timeoutCtx, cancel := context.WithTimeout(outCtx, 5*time.Second)
 		defer cancel()
 
@@ -71,9 +71,9 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 		})
 
 		if err != nil {
-			l.Error().Err(err).Msg("❌ Media Service üzerinde kayıt başlatılamadı.")
+			l.Error().Str("event", "WF_RECORD_START_FAIL").Err(err).Msg("❌ Media Service üzerinde kayıt başlatılamadı.")
 		} else {
-			l.Info().Msg("✅ Ses kaydı (RTP) başarıyla başlatıldı.")
+			l.Info().Str("event", "WF_RECORD_STARTED").Msg("✅ Ses kaydı (RTP) başarıyla başlatıldı.")
 		}
 	}
 
@@ -83,12 +83,12 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 func (p *Processor) ResumeWorkflow(ctx context.Context, callID, trigger string) {
 	session, err := p.repo.GetSession(ctx, callID)
 	if err != nil {
-		p.log.Warn().Str("call_id", callID).Msg("Session bulunamadığı için akış devam ettirilemedi.")
+		p.log.Warn().Str("event", "WF_SESSION_NOT_FOUND").Str("call_id", callID).Msg("Session bulunamadığı için akış devam ettirilemedi.")
 		return
 	}
 
 	if session["status"] != "RUNNING" {
-		p.log.Debug().Str("call_id", callID).Msg("Session RUNNING değil, Resume iptal edildi.")
+		p.log.Debug().Str("event", "WF_SESSION_NOT_RUNNING").Str("call_id", callID).Msg("Session RUNNING değil, Resume iptal edildi.")
 		return
 	}
 
@@ -113,7 +113,7 @@ func (p *Processor) ResumeWorkflow(ctx context.Context, callID, trigger string) 
 	rtpTarget := session["rtp_target"]
 
 	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
-	l.Info().Str("trigger", trigger).Str("next_step", currentStep.Next).Msg("♻️ Akış Resume edildi.")
+	l.Info().Str("event", "WF_RESUMED").Str("trigger", trigger).Str("next_step", currentStep.Next).Msg("♻️ Akış Resume edildi.")
 
 	p.executeStep(ctx, l, callID, traceID, uint32(rtpPort), rtpTarget, currentStep.Next, &wf, nil)
 }
@@ -121,14 +121,14 @@ func (p *Processor) ResumeWorkflow(ctx context.Context, callID, trigger string) 
 func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, traceID string, rtpPort uint32, rtpTarget string, stepID string, wf *Workflow, actionData map[string]string) {
 	step, exists := wf.Steps[stepID]
 	if !exists {
-		l.Warn().Str("step", stepID).Msg("Step bulunamadı, akış durdu.")
+		l.Warn().Str("event", "WF_STEP_NOT_FOUND").Str("step", stepID).Msg("Step bulunamadı, akış durdu.")
 		p.repo.UpdateSessionStatus(ctx, callID, "ERROR")
 		return
 	}
 
 	p.repo.UpdateSessionStep(ctx, callID, stepID)
 	outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
-	l.Debug().Str("step", stepID).Str("type", step.Type).Msg("Adım işleniyor...")
+	l.Debug().Str("event", "WF_STEP_PROCESSING").Str("step", stepID).Str("type", step.Type).Msg("Adım işleniyor...")
 
 	isAsync := false
 
@@ -155,9 +155,8 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		}
 
 		if audioFile != "" {
-			l.Info().Str("file", audioFile).Msg("🔊 PlayAudio gönderiliyor...")
+			l.Info().Str("event", "WF_PLAY_AUDIO_SENT").Str("file", audioFile).Msg("🔊 PlayAudio gönderiliyor...")
 
-			// [ARCH-COMPLIANCE] timeouts kuralı
 			timeoutCtx, cancel := context.WithTimeout(outCtx, 5*time.Second)
 			defer cancel()
 
@@ -167,19 +166,18 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 				RtpTargetAddr: rtpTarget,
 			})
 			if err != nil {
-				l.Warn().Err(err).Msg("Media.PlayAudio başarısız.")
+				l.Warn().Str("event", "WF_PLAY_AUDIO_FAIL").Err(err).Msg("Media.PlayAudio başarısız.")
 				isAsync = false
 			}
 		} else {
-			l.Warn().Msg("⚠️ Çalınacak ses dosyası bulunamadı, adım atlanıyor.")
+			l.Warn().Str("event", "WF_AUDIO_FILE_MISSING").Msg("⚠️ Çalınacak ses dosyası bulunamadı, adım atlanıyor.")
 			isAsync = false
 		}
 
 	case "execute_command":
 		if cmd, ok := step.Params["command"]; ok && cmd == "media.enable_echo" {
-			l.Info().Msg("🔊 Workflow: Echo Test komutu gönderiliyor...")
+			l.Info().Str("event", "WF_ECHO_TEST_SENT").Msg("🔊 Workflow: Echo Test komutu gönderiliyor...")
 
-			// [ARCH-COMPLIANCE] timeouts kuralı
 			timeoutCtx, cancel := context.WithTimeout(outCtx, 5*time.Second)
 			defer cancel()
 
@@ -189,12 +187,12 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 				RtpTargetAddr: rtpTarget,
 			})
 			if err != nil {
-				l.Error().Err(err).Msg("Media.PlayAudio (Echo) başarısız oldu.")
+				l.Error().Str("event", "WF_ECHO_TEST_FAIL").Err(err).Msg("Media.PlayAudio (Echo) başarısız oldu.")
 			}
 		}
 
 	case "handover_to_agent":
-		l.Info().Msg("🤖 Çağrı Agent Service'e devrediliyor (Handover)...")
+		l.Info().Str("event", "WF_HANDOVER_INIT").Msg("🤖 Çağrı Agent Service'e devrediliyor (Handover)...")
 		dialplanID := "DP_DEMO_AI_ASSISTANT"
 		if actionData != nil {
 			if dpID, ok := actionData["dialplan_id"]; ok && dpID != "" {
@@ -204,13 +202,12 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 
 		var err error
 		for attempt := 1; attempt <= 5; attempt++ {
-			// [ARCH-COMPLIANCE] timeouts kuralı
 			timeoutCtx, cancel := context.WithTimeout(outCtx, 5*time.Second)
 			_, err = p.clients.Agent.ProcessCallStart(timeoutCtx, &agentv1.ProcessCallStartRequest{
 				CallId:     callID,
 				DialplanId: dialplanID,
 			})
-			cancel() // Loop içinde defer yerine anında iptal
+			cancel()
 
 			if err == nil {
 				break
@@ -224,25 +221,26 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 
 		if err != nil {
 			p.repo.UpdateSessionStatus(ctx, callID, "ERROR")
-			go func(rUrl, cid string) {
-				conn, _ := amqp091.Dial(rUrl)
-				if conn != nil {
-					defer conn.Close()
-					if ch, _ := conn.Channel(); ch != nil {
-						defer ch.Close()
-						payload := fmt.Sprintf(`{"callId":"%s","reason":"system_terminated"}`, cid)
-						_ = ch.PublishWithContext(context.Background(), "sentiric_events", "call.terminate.request", false, false, amqp091.Publishing{
-							ContentType: "application/json",
-							Body:        []byte(payload),
-						})
-					}
+
+			// [ARCH-COMPLIANCE] Connection leak engellendi, shared AMQP pool kullanılıyor
+			go func(conn *amqp091.Connection, cid string) {
+				if conn == nil || conn.IsClosed() {
+					return
 				}
-			}(p.rabbitURL, callID)
+				if ch, err := conn.Channel(); err == nil {
+					defer ch.Close()
+					payload := fmt.Sprintf(`{"callId":"%s","reason":"system_terminated"}`, cid)
+					_ = ch.PublishWithContext(context.Background(), "sentiric_events", "call.terminate.request", false, false, amqp091.Publishing{
+						ContentType: "application/json",
+						Body:        []byte(payload),
+					})
+				}
+			}(p.amqpConn, callID)
 			return
 		}
 
 		p.repo.UpdateSessionStatus(ctx, callID, "HANDOVER_AGENT")
-		l.Info().Str("call_id", callID).Msg("✅ Kontrol Agent'ta.")
+		l.Info().Str("event", "WF_HANDOVER_SUCCESS").Str("call_id", callID).Msg("✅ Kontrol Agent'ta.")
 		return
 
 	case "wait":
@@ -252,27 +250,27 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 				durationSecs = parsed
 			}
 		}
-		l.Info().Int("seconds", durationSecs).Msg("⏳ Workflow bekletiliyor...")
+		l.Info().Str("event", "WF_WAITING").Int("seconds", durationSecs).Msg("⏳ Workflow bekletiliyor...")
 		time.Sleep(time.Duration(durationSecs) * time.Second)
 
 	case "hangup":
 		p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
-		l.Info().Str("call_id", callID).Msg("🛑 Hangup komutu alındı.")
+		l.Info().Str("event", "WF_HANGUP_RECEIVED").Str("call_id", callID).Msg("🛑 Hangup komutu alındı.")
 
-		go func(rUrl, cid string) {
-			conn, err := amqp091.Dial(rUrl)
-			if err == nil {
-				defer conn.Close()
-				if ch, err := conn.Channel(); err == nil {
-					defer ch.Close()
-					payload := fmt.Sprintf(`{"callId":"%s","reason":"workflow_hangup"}`, cid)
-					_ = ch.PublishWithContext(context.Background(), "sentiric_events", "call.terminate.request", false, false, amqp091.Publishing{
-						ContentType: "application/json",
-						Body:        []byte(payload),
-					})
-				}
+		// [ARCH-COMPLIANCE] Connection leak engellendi, shared AMQP pool kullanılıyor
+		go func(conn *amqp091.Connection, cid string) {
+			if conn == nil || conn.IsClosed() {
+				return
 			}
-		}(p.rabbitURL, callID)
+			if ch, err := conn.Channel(); err == nil {
+				defer ch.Close()
+				payload := fmt.Sprintf(`{"callId":"%s","reason":"workflow_hangup"}`, cid)
+				_ = ch.PublishWithContext(context.Background(), "sentiric_events", "call.terminate.request", false, false, amqp091.Publishing{
+					ContentType: "application/json",
+					Body:        []byte(payload),
+				})
+			}
+		}(p.amqpConn, callID)
 		return
 	}
 
@@ -281,9 +279,9 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 			p.executeStep(ctx, l, callID, traceID, rtpPort, rtpTarget, step.Next, wf, actionData)
 		} else {
 			p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
-			l.Info().Str("call_id", callID).Msg("✅ Workflow Tamamlandı.")
+			l.Info().Str("event", "WF_COMPLETED").Str("call_id", callID).Msg("✅ Workflow Tamamlandı.")
 		}
 	} else {
-		l.Info().Msg("⏸️ Workflow asenkron olayı (RabbitMQ) beklemek üzere RAM'den bırakıldı...")
+		l.Info().Str("event", "WF_ASYNC_PAUSED").Msg("⏸️ Workflow asenkron olayı (RabbitMQ) beklemek üzere RAM'den bırakıldı...")
 	}
 }

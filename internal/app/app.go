@@ -8,6 +8,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
 	"github.com/sentiric/sentiric-workflow-service/internal/client"
 	"github.com/sentiric/sentiric-workflow-service/internal/config"
@@ -20,26 +21,32 @@ import (
 func Run(cfg *config.Config, log zerolog.Logger) {
 	pgPool, err := database.NewPostgresConnection(cfg.PostgresURL, log)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Postgres connection failed")
+		log.Fatal().Str("event", "DB_CONN_FAIL").Err(err).Msg("Postgres connection failed")
 	}
 	defer pgPool.Close()
 
 	redisClient, err := database.NewRedisClient(cfg.RedisURL, log)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Redis connection failed")
+		log.Fatal().Str("event", "REDIS_CONN_FAIL").Err(err).Msg("Redis connection failed")
 	}
 
 	clients, err := client.NewClients(cfg, log)
 	if err != nil {
-		log.Fatal().Err(err).Msg("gRPC Clients init failed")
+		log.Fatal().Str("event", "GRPC_CLIENT_FAIL").Err(err).Msg("gRPC Clients init failed")
 	}
 	defer clients.Close()
 
-	// [DÜZELTME]: Repository artık Redis client'ı da alıyor.
+	// [ARCH-COMPLIANCE] Anti-Pattern Fix: RabbitMQ bağlantısı sadece 1 kez kurulur.
+	amqpConn, err := amqp091.Dial(cfg.RabbitMQURL)
+	if err != nil {
+		log.Fatal().Str("event", "AMQP_DIAL_FAIL").Err(err).Msg("RabbitMQ initial connection failed")
+	}
+	defer amqpConn.Close()
+
 	repo := repository.NewWorkflowRepository(pgPool, redisClient.Client, log)
 
-	// Processor'a repo iletiliyor
-	processor := engine.NewProcessor(redisClient.Client, repo, clients, cfg.RabbitMQURL, log)
+	// Bağlantı nesnesi Processor'a geçiriliyor
+	processor := engine.NewProcessor(redisClient.Client, repo, clients, amqpConn, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -47,18 +54,18 @@ func Run(cfg *config.Config, log zerolog.Logger) {
 	var wg sync.WaitGroup
 	consumer := event.NewConsumer(processor, repo, log)
 
-	if err := consumer.Start(ctx, cfg.RabbitMQURL, &wg); err != nil {
-		log.Fatal().Err(err).Msg("RabbitMQ Consumer başlatılamadı")
+	if err := consumer.Start(ctx, amqpConn, &wg); err != nil {
+		log.Fatal().Str("event", "AMQP_CONSUMER_FAIL").Err(err).Msg("RabbitMQ Consumer başlatılamadı")
 	}
 
-	log.Info().Msg("✅ Workflow Service Çalışıyor (DB Integrated). Olay bekleniyor...")
+	log.Info().Str("event", "SERVICE_READY").Msg("✅ Workflow Service Çalışıyor (DB Integrated). Olay bekleniyor...")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
-	log.Warn().Msg("Kapatma sinyali alındı. Servis durduruluyor...")
+	log.Warn().Str("event", "SHUTDOWN_SIGNAL_RECEIVED").Msg("Kapatma sinyali alındı. Servis durduruluyor...")
 	cancel()
 	wg.Wait()
-	log.Info().Msg("Servis güvenle kapatıldı.")
+	log.Info().Str("event", "SERVICE_STOPPED").Msg("Servis güvenle kapatıldı.")
 }

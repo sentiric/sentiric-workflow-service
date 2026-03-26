@@ -11,7 +11,6 @@ import (
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 
 	// Contracts
 	agentv1 "github.com/sentiric/sentiric-contracts/gen/go/sentiric/agent/v1"
@@ -26,27 +25,26 @@ type GrpcClients struct {
 	Agent agentv1.AgentOrchestrationServiceClient
 	B2bua sipv1.B2BUAServiceClient
 
-	// Bağlantıları kapatmak için
 	conns []*grpc.ClientConn
 }
 
 func NewClients(cfg *config.Config, log zerolog.Logger) (*GrpcClients, error) {
-	log.Info().Msg("🔌 Workflow Service istemcileri (mTLS Destekli) hazırlanıyor...")
+	log.Info().Str("event", "GRPC_CLIENTS_INIT").Msg("🔌 Workflow Service istemcileri (mTLS Destekli) hazırlanıyor...")
 
-	// Sertifikaları Yükle
 	var tlsCreds credentials.TransportCredentials
 	var err error
 
-	if cfg.CertPath != "" && cfg.KeyPath != "" && cfg.CaPath != "" {
-		tlsCreds, err = loadClientTLS(cfg.CertPath, cfg.KeyPath, cfg.CaPath)
-		if err != nil {
-			log.Warn().Err(err).Msg("⚠️ Sertifikalar yüklenemedi, INSECURE moda düşülüyor.")
-		} else {
-			log.Info().Msg("🔐 mTLS Sertifikaları başarıyla yüklendi.")
-		}
-	} else {
-		log.Warn().Msg("⚠️ Sertifika yolları boş, INSECURE mod kullanılıyor.")
+	// [ARCH-COMPLIANCE] mtls_failure_policy: Sessiz güvensiz moda geçiş YASAKTIR.
+	if cfg.CertPath == "" || cfg.KeyPath == "" || cfg.CaPath == "" {
+		return nil, fmt.Errorf("FATAL [mTLS Policy Violation]: Sertifika yolları (CERT/KEY/CA) eksik belirtilmiş")
 	}
+
+	tlsCreds, err = loadClientTLS(cfg.CertPath, cfg.KeyPath, cfg.CaPath)
+	if err != nil {
+		return nil, fmt.Errorf("FATAL [mTLS Policy Violation]: Sertifikalar yüklenemedi: %w", err)
+	}
+
+	log.Info().Str("event", "MTLS_CERTS_LOADED").Msg("🔐 mTLS Sertifikaları başarıyla yüklendi.")
 
 	// 1. Media Service
 	mediaConn, err := connect(cfg.MediaServiceURL, "media-service", tlsCreds)
@@ -66,7 +64,7 @@ func NewClients(cfg *config.Config, log zerolog.Logger) (*GrpcClients, error) {
 		return nil, fmt.Errorf("b2bua service connect fail: %w", err)
 	}
 
-	log.Info().Msg("✅ Tüm gRPC istemcileri başarıyla bağlandı.")
+	log.Info().Str("event", "GRPC_CLIENTS_READY").Msg("✅ Tüm gRPC istemcileri başarıyla bağlandı.")
 
 	return &GrpcClients{
 		Media: mediav1.NewMediaServiceClient(mediaConn),
@@ -85,37 +83,28 @@ func (c *GrpcClients) Close() {
 func connect(targetURL string, serverName string, tlsCreds credentials.TransportCredentials) (*grpc.ClientConn, error) {
 	var opts []grpc.DialOption
 
-	// URL Sanitization
 	cleanTarget := targetURL
-	isHttps := strings.HasPrefix(targetURL, "https://")
-
 	for _, prefix := range []string{"https://", "http://"} {
 		cleanTarget = strings.TrimPrefix(cleanTarget, prefix)
 	}
 
-	// Eğer HTTPS ise ve sertifika varsa mTLS kullan
-	if isHttps && tlsCreds != nil {
-		opts = append(opts, grpc.WithTransportCredentials(tlsCreds))
-		// SNI (Server Name Indication) için Authority override.
-		// Sertifikalar 'sentiric.cloud' veya servis adı üzerine olabilir.
-		// En güvenli yöntem serverName'i kullanmaktır.
-		opts = append(opts, grpc.WithAuthority(serverName))
-	} else {
-		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// [ARCH-COMPLIANCE] Asla güvensiz credentials kullanılamaz.
+	if tlsCreds == nil {
+		return nil, fmt.Errorf("tlsCreds is nil, insecure fallback is forbidden")
 	}
 
-	// Bloklamayan bağlantı (Lazy connection)
+	opts = append(opts, grpc.WithTransportCredentials(tlsCreds))
+	opts = append(opts, grpc.WithAuthority(serverName))
+
 	return grpc.NewClient(cleanTarget, opts...)
 }
 
 func loadClientTLS(certPath, keyPath, caPath string) (credentials.TransportCredentials, error) {
-	// İstemci Sertifikası (Client Cert)
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("client cert load error: %w", err)
 	}
 
-	// CA Sertifikası (Root CA)
 	caPem, err := os.ReadFile(caPath)
 	if err != nil {
 		return nil, fmt.Errorf("CA cert load error: %w", err)
@@ -126,11 +115,9 @@ func loadClientTLS(certPath, keyPath, caPath string) (credentials.TransportCrede
 		return nil, fmt.Errorf("failed to append CA cert")
 	}
 
-	// TLS Config
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      certPool,
-		// InsecureSkipVerify: true, // PROD İÇİN ASLA AÇMA (Sadece debug)
 	}
 
 	return credentials.NewTLS(tlsConfig), nil
