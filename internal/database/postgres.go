@@ -10,14 +10,14 @@ import (
 )
 
 func NewPostgresConnection(url string, log zerolog.Logger) (*pgxpool.Pool, error) {
-	log.Info().Msg("🐘 PostgreSQL bağlantısı başlatılıyor...")
+	// [ARCH-COMPLIANCE] ARCH-007 İhlal Düzeltimi: 'event' anahtarı zorunluluğu
+	log.Info().Str("event", "POSTGRES_CONNECTING").Msg("🐘 PostgreSQL bağlantısı başlatılıyor...")
 
 	config, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, fmt.Errorf("postgres config parse error: %w", err)
 	}
 
-	// Bağlantı havuzu ayarları
 	config.MaxConns = 10
 	config.MinConns = 2
 	config.MaxConnLifetime = time.Hour
@@ -35,6 +35,6 @@ func NewPostgresConnection(url string, log zerolog.Logger) (*pgxpool.Pool, error
 		return nil, fmt.Errorf("postgres ping failed: %w", err)
 	}
 
-	log.Info().Msg("✅ PostgreSQL bağlantısı sağlandı.")
+	log.Info().Str("event", "POSTGRES_CONNECTED").Msg("✅ PostgreSQL bağlantısı sağlandı.")
 	return pool, nil
 }

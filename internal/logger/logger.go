@@ -1,3 +1,4 @@
+// Dosya: internal/logger/logger.go
 package logger
 
 import (
@@ -7,7 +8,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-func New(serviceName string, env string, level string) zerolog.Logger {
+func New(serviceName string, version string, env string, level string) zerolog.Logger {
 	l, _ := zerolog.ParseLevel(level)
 
 	zerolog.TimeFieldFormat = time.RFC3339Nano
@@ -15,12 +16,13 @@ func New(serviceName string, env string, level string) zerolog.Logger {
 	zerolog.LevelFieldName = "severity"
 	zerolog.MessageFieldName = "message"
 
-	// JSON Logger (Production)
+	// [ARCH-COMPLIANCE] SUTS v4.0: resource.service.version zorunluluğu eklendi.
 	logger := zerolog.New(os.Stderr).
 		With().
 		Timestamp().
 		Str("schema_v", "1.0.0").
 		Str("resource.service.name", serviceName).
+		Str("resource.service.version", version).
 		Str("resource.service.env", env).
 		Logger()
 

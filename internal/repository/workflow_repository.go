@@ -67,7 +67,8 @@ func (r *WorkflowRepository) CreateSession(ctx context.Context, callID, workflow
 	}).Err()
 
 	if err != nil {
-		r.log.Error().Err(err).Msg("❌ Redis HSet error during CreateSession")
+		// [ARCH-COMPLIANCE] ARCH-007
+		r.log.Error().Str("event", "REDIS_HSET_ERROR").Err(err).Msg("❌ Redis HSet error during CreateSession")
 		return err
 	}
 
@@ -112,17 +113,18 @@ func (r *WorkflowRepository) UpdateSessionStatus(ctx context.Context, callID, st
 					VALUES ($1, $2, $3, $4::jsonb)
 				`
 				_, dbErr := r.db.Exec(ctx, query, callID, wfID, dbStatus, stateJSON)
+
 				if dbErr != nil {
-					r.log.Error().Err(dbErr).Str("call_id", callID).Msg("❌ DB Write Fail")
+					r.log.Error().Str("event", "DB_WRITE_FAIL").Err(dbErr).Str("call_id", callID).Msg("❌ DB Write Fail")
 				} else {
-					r.log.Info().Str("call_id", callID).Msg("💾 Workflow Audit Log archived (First & Only trigger).")
+					r.log.Info().Str("event", "AUDIT_LOG_ARCHIVED").Str("call_id", callID).Msg("💾 Workflow Audit Log archived (First & Only trigger).")
 				}
+
 			}
 			// Bellek temizliği için TTL'i düşür
 			r.redis.Expire(ctx, key, 5*time.Minute)
 		} else {
-			// Daha önce başka bir trigger (örn: processor) tarafından yazılmış.
-			r.log.Debug().Str("call_id", callID).Msg("⏭️ Session already archived. Skipping duplicate DB insert.")
+			r.log.Debug().Str("event", "SESSION_ALREADY_ARCHIVED").Str("call_id", callID).Msg("⏭️ Session already archived. Skipping duplicate DB insert.")
 		}
 
 	}
@@ -160,7 +162,7 @@ func (r *WorkflowRepository) GetAnnouncementPath(ctx context.Context, annID, ten
 
 	err := r.db.QueryRow(ctx, query, annID, langCode, tenantID).Scan(&audioPath)
 	if err != nil {
-		r.log.Error().Err(err).Str("ann_id", annID).Str("lang", langCode).Msg("Anons veritabanında bulunamadı!")
+		r.log.Error().Str("event", "ANNOUNCEMENT_NOT_FOUND").Err(err).Str("ann_id", annID).Str("lang", langCode).Msg("Anons veritabanında bulunamadı!")
 		return "", err
 	}
 	return audioPath, nil

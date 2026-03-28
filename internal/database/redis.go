@@ -14,7 +14,8 @@ type RedisClient struct {
 }
 
 func NewRedisClient(url string, log zerolog.Logger) (*RedisClient, error) {
-	log.Info().Msg("🔴 Redis bağlantısı başlatılıyor...")
+	// [ARCH-COMPLIANCE] ARCH-007 İhlal Düzeltimi
+	log.Info().Str("event", "REDIS_CONNECTING").Msg("🔴 Redis bağlantısı başlatılıyor...")
 
 	opts, err := redis.ParseURL(url)
 	if err != nil {
@@ -30,6 +31,6 @@ func NewRedisClient(url string, log zerolog.Logger) (*RedisClient, error) {
 		return nil, fmt.Errorf("redis ping failed: %w", err)
 	}
 
-	log.Info().Msg("✅ Redis bağlantısı sağlandı.")
+	log.Info().Str("event", "REDIS_CONNECTED").Msg("✅ Redis bağlantısı sağlandı.")
 	return &RedisClient{Client: client}, nil
 }

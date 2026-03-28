@@ -97,7 +97,8 @@ func (c *Consumer) routeMessage(ctx context.Context, d amqp091.Delivery) {
 	case "call.ended":
 		c.handleCallEnded(ctx, d.Body)
 	default:
-		c.log.Debug().Str("routing_key", d.RoutingKey).Msg("İlgilenilmeyen event geldi, geçiliyor.")
+		// [ARCH-COMPLIANCE] ARCH-007
+		c.log.Debug().Str("event", "AMQP_IGNORED_EVENT").Str("routing_key", d.RoutingKey).Msg("İlgilenilmeyen event geldi, geçiliyor.")
 	}
 }
 
@@ -106,7 +107,7 @@ func (c *Consumer) handlePlaybackFinished(ctx context.Context, body []byte) {
 	if err := proto.Unmarshal(body, &event); err != nil {
 		return
 	}
-	c.log.Info().Str("call_id", event.TraceId).Msg("▶️ Playback bitti. Asenkron akış devam ettiriliyor...")
+	c.log.Info().Str("event", "PLAYBACK_FINISHED_RESUME").Str("call_id", event.TraceId).Msg("▶️ Playback bitti. Asenkron akış devam ettiriliyor...")
 	c.processor.ResumeWorkflow(ctx, event.TraceId, "playback_finished")
 }
 
@@ -115,7 +116,7 @@ func (c *Consumer) handleCallEnded(ctx context.Context, body []byte) {
 	if err := proto.Unmarshal(body, &event); err != nil {
 		return
 	}
-	c.log.Info().Str("call_id", event.CallId).Msg("📞 Çağrı sonlandı. Oturum kapatılıyor.")
+	c.log.Info().Str("event", "CALL_ENDED_SESSION_CLOSE").Str("call_id", event.CallId).Msg("📞 Çağrı sonlandı. Oturum kapatılıyor.")
 	c.repo.UpdateSessionStatus(ctx, event.CallId, "COMPLETED")
 }
 
@@ -142,11 +143,12 @@ func (c *Consumer) handleCallStarted(ctx context.Context, body []byte) {
 		}
 
 		if targetWfID != "" {
-			l.Info().Str("wf_id", targetWfID).Msg("📂 Veritabanından Workflow tanımı yükleniyor...")
+			// [ARCH-COMPLIANCE] ARCH-007
+			l.Info().Str("event", "WF_DEFINITION_LOADING").Str("wf_id", targetWfID).Msg("📂 Veritabanından Workflow tanımı yükleniyor...")
 			if def, err := c.repo.GetWorkflowDefinition(ctx, targetWfID); err == nil {
 				dialplanDef = def
 			} else {
-				l.Error().Err(err).Str("wf_id", targetWfID).Msg("❌ Workflow DB'de bulunamadı!")
+				l.Error().Str("event", "WF_DEFINITION_NOT_FOUND").Err(err).Str("wf_id", targetWfID).Msg("❌ Workflow DB'de bulunamadı!")
 				dialplanDef = `{"id": "wf_fallback", "start_node": "end", "steps": {"end": {"type": "hangup"}}}`
 			}
 		} else {

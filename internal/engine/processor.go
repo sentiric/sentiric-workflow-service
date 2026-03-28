@@ -22,6 +22,7 @@ import (
 
 	"github.com/sentiric/sentiric-workflow-service/internal/client"
 	"github.com/sentiric/sentiric-workflow-service/internal/repository"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -37,6 +38,7 @@ func NewProcessor(r *redis.Client, repo *repository.WorkflowRepository, c *clien
 	return &Processor{redis: r, repo: repo, clients: c, amqpConn: amqpConn, log: l}
 }
 
+// StartWorkflow içindeki Logger oluşturma bloğu güncellendi:
 func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, rtpPort uint32, rtpTarget string, workflowDefJSON string, actionData map[string]string) {
 	var wf Workflow
 	if err := json.Unmarshal([]byte(workflowDefJSON), &wf); err != nil {
@@ -52,7 +54,18 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 		}
 	}
 
-	l := p.log.With().Str("trace_id", traceID).Str("call_id", callID).Logger()
+	// [ARCH-COMPLIANCE] SUTS v4.0: span_id kuralı uygulandı.
+	spanID := trace.SpanFromContext(ctx).SpanContext().SpanID().String()
+	if spanID == "0000000000000000" {
+		spanID = "" // Span yoksa boş bırak (SUTS şeması null veya string kabul eder)
+	}
+
+	l := p.log.With().
+		Str("trace_id", traceID).
+		Str("span_id", spanID).
+		Str("call_id", callID).
+		Logger()
+
 	l.Info().Str("event", "WF_STARTING").Str("wf_id", wf.ID).Msg("🚀 Workflow Başlatılıyor")
 
 	if err := p.repo.CreateSession(ctx, callID, wf.ID, wf.StartNode, traceID, rtpPort, rtpTarget); err != nil {
