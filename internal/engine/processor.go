@@ -1,7 +1,6 @@
 // Dosya: sentiric-workflow-service/internal/engine/processor.go
 package engine
 
-// [ARCH-COMPLIANCE] RabbitMQ Payload'ları GenericEvent (Protobuf) formatında gönderilmeli.
 import (
 	"context"
 	"encoding/json"
@@ -10,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
@@ -21,24 +19,24 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/sentiric/sentiric-workflow-service/internal/client"
+	"github.com/sentiric/sentiric-workflow-service/internal/queue"
 	"github.com/sentiric/sentiric-workflow-service/internal/repository"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/metadata"
 )
 
 type Processor struct {
-	redis    *redis.Client
-	repo     *repository.WorkflowRepository
-	clients  *client.GrpcClients
-	log      zerolog.Logger
-	amqpConn *amqp091.Connection // [ARCH-COMPLIANCE] Shared AMQP Connection
+	redis   *redis.Client
+	repo    *repository.WorkflowRepository
+	clients *client.GrpcClients
+	log     zerolog.Logger
+	rmq     *queue.RabbitMQ // AMQP Connection yerine doğrudan Publisher interface'i
 }
 
-func NewProcessor(r *redis.Client, repo *repository.WorkflowRepository, c *client.GrpcClients, amqpConn *amqp091.Connection, l zerolog.Logger) *Processor {
-	return &Processor{redis: r, repo: repo, clients: c, amqpConn: amqpConn, log: l}
+func NewProcessor(r *redis.Client, repo *repository.WorkflowRepository, c *client.GrpcClients, rmq *queue.RabbitMQ, l zerolog.Logger) *Processor {
+	return &Processor{redis: r, repo: repo, clients: c, rmq: rmq, log: l}
 }
 
-// StartWorkflow içindeki Logger oluşturma bloğu güncellendi:
 func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, rtpPort uint32, rtpTarget string, workflowDefJSON string, actionData map[string]string) {
 	var wf Workflow
 	if err := json.Unmarshal([]byte(workflowDefJSON), &wf); err != nil {
@@ -54,10 +52,9 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 		}
 	}
 
-	// [ARCH-COMPLIANCE] SUTS v4.0: span_id kuralı uygulandı.
 	spanID := trace.SpanFromContext(ctx).SpanContext().SpanID().String()
 	if spanID == "0000000000000000" {
-		spanID = "" // Span yoksa boş bırak (SUTS şeması null veya string kabul eder)
+		spanID = ""
 	}
 
 	l := p.log.With().
@@ -77,8 +74,6 @@ func (p *Processor) StartWorkflow(ctx context.Context, callID, traceID string, r
 		l.Info().Str("event", "WF_RECORD_INIT").Msg("🎙️ Çağrı kayıt izni tespit edildi. Media Service üzerinde kayıt başlatılıyor...")
 
 		outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
-
-		//[ARCH-COMPLIANCE] timeouts kuralı
 		timeoutCtx, cancel := context.WithTimeout(outCtx, 5*time.Second)
 		defer cancel()
 
@@ -241,32 +236,17 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		if err != nil {
 			p.repo.UpdateSessionStatus(ctx, callID, "ERROR")
 
-			// [ARCH-COMPLIANCE] Connection leak engellendi, Payload Protobuf'a çevrildi
-			go func(conn *amqp091.Connection, cid string, reasonStr string) {
-				if conn == nil || conn.IsClosed() {
-					return
-				}
-				if ch, err := conn.Channel(); err == nil {
-					defer ch.Close()
-
-					payloadJSON := fmt.Sprintf(`{"callId":"%s","reason":"%s"}`, cid, reasonStr)
-
-					pbEvent := &eventv1.GenericEvent{
-						EventType:   "call.terminate.request",
-						TraceId:     cid,
-						Timestamp:   timestamppb.Now(),
-						TenantId:    "system",
-						PayloadJson: payloadJSON,
-					}
-
-					body, _ := proto.Marshal(pbEvent)
-
-					_ = ch.PublishWithContext(context.Background(), "sentiric_events", "call.terminate.request", false, false, amqp091.Publishing{
-						ContentType: "application/protobuf",
-						Body:        body,
-					})
-				}
-			}(p.amqpConn, callID, "system_terminated") // "hangup" case'i için buraya "workflow_hangup" yazın.
+			// [ARCH-COMPLIANCE] Connection leak engellendi, Ghost Publisher kullanılıyor.
+			payloadJSON := fmt.Sprintf(`{"callId":"%s","reason":"%s"}`, callID, "system_terminated")
+			pbEvent := &eventv1.GenericEvent{
+				EventType:   "call.terminate.request",
+				TraceId:     callID,
+				Timestamp:   timestamppb.Now(),
+				TenantId:    "system",
+				PayloadJson: payloadJSON,
+			}
+			body, _ := proto.Marshal(pbEvent)
+			_ = p.rmq.PublishProtobuf(context.Background(), "call.terminate.request", body)
 			return
 		}
 
@@ -288,32 +268,17 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
 		l.Info().Str("event", "WF_HANGUP_RECEIVED").Str("call_id", callID).Msg("🛑 Hangup komutu alındı.")
 
-		// [ARCH-COMPLIANCE] Connection leak engellendi, Payload Protobuf'a çevrildi
-		go func(conn *amqp091.Connection, cid string, reasonStr string) {
-			if conn == nil || conn.IsClosed() {
-				return
-			}
-			if ch, err := conn.Channel(); err == nil {
-				defer ch.Close()
-
-				payloadJSON := fmt.Sprintf(`{"callId":"%s","reason":"%s"}`, cid, reasonStr)
-
-				pbEvent := &eventv1.GenericEvent{
-					EventType:   "call.terminate.request",
-					TraceId:     cid,
-					Timestamp:   timestamppb.Now(),
-					TenantId:    "system",
-					PayloadJson: payloadJSON,
-				}
-
-				body, _ := proto.Marshal(pbEvent)
-
-				_ = ch.PublishWithContext(context.Background(), "sentiric_events", "call.terminate.request", false, false, amqp091.Publishing{
-					ContentType: "application/protobuf",
-					Body:        body,
-				})
-			}
-		}(p.amqpConn, callID, "workflow_hangup") // "hangup" case'i için buraya "workflow_hangup" yazın.
+		// [ARCH-COMPLIANCE] Connection leak engellendi, Ghost Publisher kullanılıyor.
+		payloadJSON := fmt.Sprintf(`{"callId":"%s","reason":"%s"}`, callID, "workflow_hangup")
+		pbEvent := &eventv1.GenericEvent{
+			EventType:   "call.terminate.request",
+			TraceId:     callID,
+			Timestamp:   timestamppb.Now(),
+			TenantId:    "system",
+			PayloadJson: payloadJSON,
+		}
+		body, _ := proto.Marshal(pbEvent)
+		_ = p.rmq.PublishProtobuf(context.Background(), "call.terminate.request", body)
 		return
 	}
 

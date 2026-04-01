@@ -2,39 +2,36 @@ package database
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 )
 
-func NewPostgresConnection(url string, log zerolog.Logger) (*pgxpool.Pool, error) {
-	// [ARCH-COMPLIANCE] ARCH-007 İhlal Düzeltimi: 'event' anahtarı zorunluluğu
+func NewPostgresConnection(url string, log zerolog.Logger) *pgxpool.Pool {
 	log.Info().Str("event", "POSTGRES_CONNECTING").Msg("🐘 PostgreSQL bağlantısı başlatılıyor...")
 
-	config, err := pgxpool.ParseConfig(url)
-	if err != nil {
-		return nil, fmt.Errorf("postgres config parse error: %w", err)
-	}
-
+	config, _ := pgxpool.ParseConfig(url)
 	config.MaxConns = 10
 	config.MinConns = 2
 	config.MaxConnLifetime = time.Hour
 	config.MaxConnIdleTime = 30 * time.Minute
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	pool, _ := pgxpool.NewWithConfig(context.Background(), config)
 
-	pool, err := pgxpool.NewWithConfig(ctx, config)
-	if err != nil {
-		return nil, fmt.Errorf("postgres connection error: %w", err)
-	}
+	go func() {
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := pool.Ping(ctx)
+			cancel()
+			if err == nil {
+				log.Info().Str("event", "POSTGRES_CONNECTED").Msg("✅ PostgreSQL bağlantısı sağlandı.")
+				return
+			}
+			log.Warn().Str("event", "POSTGRES_RETRY").Err(err).Msg("PostgreSQL bağlantısı yok, yeniden denenecek...")
+			time.Sleep(5 * time.Second)
+		}
+	}()
 
-	if err := pool.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("postgres ping failed: %w", err)
-	}
-
-	log.Info().Str("event", "POSTGRES_CONNECTED").Msg("✅ PostgreSQL bağlantısı sağlandı.")
-	return pool, nil
+	return pool
 }

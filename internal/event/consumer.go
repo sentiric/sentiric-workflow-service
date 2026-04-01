@@ -1,4 +1,3 @@
-// Dosya: sentiric-workflow-service/internal/event/consumer.go
 package event
 
 import (
@@ -31,61 +30,56 @@ func NewConsumer(processor *engine.Processor, repo *repository.WorkflowRepositor
 	return &Consumer{processor: processor, repo: repo, log: log}
 }
 
-func (c *Consumer) Start(ctx context.Context, conn *amqp091.Connection, wg *sync.WaitGroup) error {
-	ch, err := conn.Channel()
+func (c *Consumer) SetupTopology(ch *amqp091.Channel) error {
+	_ = ch.ExchangeDeclare(dlxName, "topic", true, false, false, false, nil)
+	_, _ = ch.QueueDeclare(dlqName, true, false, false, false, nil)
+	_ = ch.QueueBind(dlqName, "#", dlxName, false, nil)
+	_ = ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil)
+
+	args := amqp091.Table{"x-dead-letter-exchange": dlxName}
+	q, err := ch.QueueDeclare(queueName, true, false, false, false, args)
 	if err != nil {
 		return err
 	}
 
-	//[ARCH-COMPLIANCE] constraints.yaml: dead_letter_queue kuralı gereği DLX ve DLQ tanımlanır.
-	_ = ch.ExchangeDeclare(dlxName, "topic", true, false, false, false, nil)
-	_, _ = ch.QueueDeclare(dlqName, true, false, false, false, nil)
-	_ = ch.QueueBind(dlqName, "#", dlxName, false, nil)
-
-	_ = ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil)
-
-	args := amqp091.Table{
-		"x-dead-letter-exchange": dlxName,
-	}
-	q, _ := ch.QueueDeclare(queueName, true, false, false, false, args)
-
 	_ = ch.QueueBind(q.Name, "call.started", exchangeName, false, nil)
 	_ = ch.QueueBind(q.Name, "call.media.playback.finished", exchangeName, false, nil)
 	_ = ch.QueueBind(q.Name, "call.ended", exchangeName, false, nil)
+	return nil
+}
 
-	msgs, _ := ch.Consume(q.Name, "", false, false, false, false, nil)
+func (c *Consumer) Consume(ctx context.Context, ch *amqp091.Channel, wg *sync.WaitGroup) {
+	msgs, err := ch.Consume(queueName, "", false, false, false, false, nil)
+	if err != nil {
+		c.log.Error().Str("event", "RMQ_CONSUME_FAIL").Err(err).Msg("Consume başlatılamadı")
+		return
+	}
 
 	c.log.Info().Str("event", "AMQP_CONSUMER_STARTED").Msg("🐰 Workflow Consumer: Olaylar Dinleniyor (SRE DLX Aktif)...")
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer ch.Close()
-
-		for {
-			select {
-			case <-ctx.Done():
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case d, ok := <-msgs:
+			if !ok {
 				return
-			case d, ok := <-msgs:
-				if !ok {
-					return
-				}
-
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							c.log.Error().Str("event", "AMQP_MESSAGE_PANIC").Interface("panic", r).Msg("CRITICAL: Workflow mesajı işlerken panikledi. DLX'e atılıyor.")
-							_ = d.Nack(false, false)
-						}
-					}()
-
-					c.routeMessage(ctx, d)
-					_ = d.Ack(false)
-				}()
 			}
+			wg.Add(1)
+			go func(msg amqp091.Delivery) {
+				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						c.log.Error().Str("event", "AMQP_MESSAGE_PANIC").Interface("panic", r).Msg("CRITICAL: Workflow mesajı işlerken panikledi. DLX'e atılıyor.")
+						_ = msg.Nack(false, false)
+					}
+				}()
+
+				c.routeMessage(ctx, msg)
+				_ = msg.Ack(false)
+			}(d)
 		}
-	}()
-	return nil
+	}
 }
 
 func (c *Consumer) routeMessage(ctx context.Context, d amqp091.Delivery) {
@@ -97,7 +91,6 @@ func (c *Consumer) routeMessage(ctx context.Context, d amqp091.Delivery) {
 	case "call.ended":
 		c.handleCallEnded(ctx, d.Body)
 	default:
-		// [ARCH-COMPLIANCE] ARCH-007
 		c.log.Debug().Str("event", "AMQP_IGNORED_EVENT").Str("routing_key", d.RoutingKey).Msg("İlgilenilmeyen event geldi, geçiliyor.")
 	}
 }
@@ -143,7 +136,6 @@ func (c *Consumer) handleCallStarted(ctx context.Context, body []byte) {
 		}
 
 		if targetWfID != "" {
-			// [ARCH-COMPLIANCE] ARCH-007
 			l.Info().Str("event", "WF_DEFINITION_LOADING").Str("wf_id", targetWfID).Msg("📂 Veritabanından Workflow tanımı yükleniyor...")
 			if def, err := c.repo.GetWorkflowDefinition(ctx, targetWfID); err == nil {
 				dialplanDef = def
