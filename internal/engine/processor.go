@@ -255,14 +255,27 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 		return
 
 	case "wait":
+		// [CRITICAL FIX]: RabbitMQ Consumer'ı bloklamamak için adımı asenkron işaretle.
+		isAsync = true
 		durationSecs := 2
 		if dsStr, ok := step.Params["duration_seconds"]; ok {
 			if parsed, err := strconv.Atoi(dsStr); err == nil {
 				durationSecs = parsed
 			}
 		}
-		l.Info().Str("event", "WF_WAITING").Int("seconds", durationSecs).Msg("⏳ Workflow bekletiliyor...")
-		time.Sleep(time.Duration(durationSecs) * time.Second)
+		l.Info().Str("event", "WF_WAITING_ASYNC").Int("seconds", durationSecs).Msg("⏳ Workflow bekletiliyor (Asenkron)...")
+
+		// Goroutine closure için değişkenleri kopyala
+		nextStep := step.Next
+		go func(cid, tid, nStep, rTarget string, rPort uint32, w *Workflow, actData map[string]string) {
+			time.Sleep(time.Duration(durationSecs) * time.Second)
+			if nStep != "" {
+				p.executeStep(context.Background(), l, cid, tid, rPort, rTarget, nStep, w, actData)
+			} else {
+				p.repo.UpdateSessionStatus(context.Background(), cid, "COMPLETED")
+				l.Info().Str("event", "WF_COMPLETED").Str("call_id", cid).Msg("✅ Workflow Tamamlandı.")
+			}
+		}(callID, traceID, nextStep, rtpTarget, rtpPort, wf, actionData)
 
 	case "hangup":
 		p.repo.UpdateSessionStatus(ctx, callID, "COMPLETED")
