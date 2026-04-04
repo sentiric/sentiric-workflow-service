@@ -11,7 +11,6 @@ import (
 
 func main() {
 	cfg, err := config.Load()
-
 	// [ARCH-COMPLIANCE] ARCH-005 İhlal Düzeltimi: log.Fatalf kullanılamaz.
 	// Config hatası varsa geçici bir bootstrap logger ile SUTS formatında Fatal basılır.
 	if err != nil {

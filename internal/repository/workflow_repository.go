@@ -65,7 +65,6 @@ func (r *WorkflowRepository) CreateSession(ctx context.Context, callID, workflow
 		"rtp_target":   rtpTarget,
 		"updated_at":   time.Now().Format(time.RFC3339),
 	}).Err()
-
 	if err != nil {
 		// [ARCH-COMPLIANCE] ARCH-007
 		r.log.Error().Str("event", "REDIS_HSET_ERROR").Err(err).Msg("❌ Redis HSet error during CreateSession")

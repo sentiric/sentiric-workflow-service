@@ -27,7 +27,7 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
-	godotenv.Load()
+	_ = godotenv.Load()
 
 	// Yardımcı fonksiyonlarla hataları topla
 	pgURL, err := getEnvOrFail("POSTGRES_URL")
