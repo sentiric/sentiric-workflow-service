@@ -45,6 +45,8 @@ func (c *Consumer) SetupTopology(ch *amqp091.Channel) error {
 	_ = ch.QueueBind(q.Name, "call.started", exchangeName, false, nil)
 	_ = ch.QueueBind(q.Name, "call.media.playback.finished", exchangeName, false, nil)
 	_ = ch.QueueBind(q.Name, "call.ended", exchangeName, false, nil)
+	// [ARCH-COMPLIANCE FIX]: Deep Waters event bind eklendi
+	_ = ch.QueueBind(q.Name, "acoustic.mood.shifted", exchangeName, false, nil)
 	return nil
 }
 
@@ -90,9 +92,29 @@ func (c *Consumer) routeMessage(ctx context.Context, d amqp091.Delivery) {
 		c.handlePlaybackFinished(ctx, d.Body)
 	case "call.ended":
 		c.handleCallEnded(ctx, d.Body)
+	// [ARCH-COMPLIANCE FIX]: Acoustic Mood Shift yakalanıyor
+	case "acoustic.mood.shifted":
+		c.handleMoodShifted(ctx, d.Body)
 	default:
 		c.log.Debug().Str("event", "AMQP_IGNORED_EVENT").Str("routing_key", d.RoutingKey).Msg("İlgilenilmeyen event geldi, geçiliyor.")
 	}
+}
+
+func (c *Consumer) handleMoodShifted(ctx context.Context, body []byte) {
+	var event eventv1.AcousticMoodShiftedEvent
+	if err := proto.Unmarshal(body, &event); err != nil {
+		c.log.Warn().Str("event", "PROTO_UNMARSHAL_FAIL").Err(err).Msg("Mood shifted event parse edilemedi.")
+		return
+	}
+
+	// Workflow logic: Eğer kullanıcı aşırı sinirliyse (arousal > 0.8) akışta bir flag set edebiliriz.
+	// Şimdilik sadece logluyoruz (Sovereign Observability)
+	c.log.Info().
+		Str("event", "MOOD_SHIFT_OBSERVED").
+		Str("trace_id", event.TraceId).
+		Str("mood", event.CurrentMood).
+		Float32("arousal", event.ArousalShift).
+		Msg("🌊 Workflow: Kullanıcının ruh hali değişimi saptandı.")
 }
 
 func (c *Consumer) handlePlaybackFinished(ctx context.Context, body []byte) {
