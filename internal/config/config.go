@@ -57,7 +57,7 @@ func Load() (*Config, error) {
 
 	return &Config{
 		// versiyınun nasıl takip edileceği konusunda bir standart belirlenebilir, ci ile otomatik inject edilebilir , semver kullanılabilir
-		ServiceVersion: getEnv("SERVICE_VERSION", "1.0.6"), // Dockerfile env inject
+		ServiceVersion: getEnv("SERVICE_VERSION", "1.0.7"), // Dockerfile env inject
 		Env:            getEnv("ENV", "production"),
 		LogLevel:       getEnv("LOG_LEVEL", "info"),
 		LogFormat:      getEnv("LOG_FORMAT", "json"),

@@ -131,7 +131,15 @@ func (c *Consumer) handleCallEnded(ctx context.Context, body []byte) {
 	if err := proto.Unmarshal(body, &event); err != nil {
 		return
 	}
-	c.log.Info().Str("event", "CALL_ENDED_SESSION_CLOSE").Str("call_id", event.CallId).Msg("📞 Çağrı sonlandı. Oturum kapatılıyor.")
+
+	// [ARCH-COMPLIANCE FIX]: Trace ID Authority
+	// Kapanış logunda da orijinal TraceId'yi koru, CallId'yi attribute olarak bırak.
+	l := c.log.With().
+		Str("trace_id", event.TraceId).
+		Str("call_id", event.CallId).
+		Logger()
+
+	l.Info().Str("event", "CALL_ENDED_SESSION_CLOSE").Msg("📞 Çağrı sonlandı. Oturum kapatılıyor.")
 	c.repo.UpdateSessionStatus(ctx, event.CallId, "COMPLETED")
 }
 
