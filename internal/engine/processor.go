@@ -142,6 +142,8 @@ func (p *Processor) executeStep(ctx context.Context, l zerolog.Logger, callID, t
 
 	p.repo.UpdateSessionStep(ctx, callID, stepID)
 	outCtx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", traceID)
+
+	// [ARCH-COMPLIANCE] SUTS v4.2: Adım bazlı mikro-loglar DEBUG'a çekildi.
 	l.Debug().Str("event", "WF_STEP_PROCESSING").Str("step", stepID).Str("type", step.Type).Msg("Adım işleniyor...")
 
 	isAsync := false
