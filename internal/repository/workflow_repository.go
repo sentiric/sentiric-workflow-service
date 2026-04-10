@@ -85,18 +85,14 @@ func (r *WorkflowRepository) UpdateSessionStep(ctx context.Context, callID, step
 func (r *WorkflowRepository) UpdateSessionStatus(ctx context.Context, callID, status string) {
 	key := fmt.Sprintf("wf_session:%s", callID)
 
-	// 1. Redis durumunu her zaman güncelle (Real-time izleme için)
+	// 1. Redis durumunu her zaman güncelle
 	r.redis.HSet(ctx, key, "status", status, "updated_at", time.Now().Format(time.RFC3339))
 
-	// 2. Terminal durum kontrolü (COMPLETED, ERROR, HANDOVER)
+	// 2. Terminal durum kontrolü
 	if status == "COMPLETED" || status == "ERROR" || status == "HANDOVER_AGENT" {
-
-		// [SRE IDEMPOTENCY LATCH]: Sadece bir kez PostgreSQL'e yazılmasını garanti et.
-		// 'is_archived' alanını sadece yoksa 'true' yapar.
 		isFirstTime, _ := r.redis.HSetNX(ctx, key, "is_archived", "true").Result()
 
 		if isFirstTime {
-			// Yarışı bu thread kazandı, DB insert işlemini yapabilir.
 			sessionData, err := r.GetSession(ctx, callID)
 			if err == nil && len(sessionData) > 0 {
 				wfID := sessionData["workflow_id"]
@@ -107,25 +103,35 @@ func (r *WorkflowRepository) UpdateSessionStatus(ctx context.Context, callID, st
 					dbStatus = "FAILED"
 				}
 
-				query := `
-					INSERT INTO workflow_execution_logs (call_id, workflow_id, status, final_state_data) 
-					VALUES ($1, $2, $3, $4::jsonb)
-				`
-				_, dbErr := r.db.Exec(ctx, query, callID, wfID, dbStatus, stateJSON)
-
-				if dbErr != nil {
-					r.log.Error().Str("event", "DB_WRITE_FAIL").Err(dbErr).Str("call_id", callID).Msg("❌ DB Write Fail")
+				// [ARCH-COMPLIANCE FIX]: Web/Otonom Oturum Koruması
+				// Eğer workflow_id boşsa veya "wf_unknown" ise, Foreign Key hatasını önlemek için
+				// bu logu sadece Redis'te bırak, PostgreSQL'e yazma. (Veya default bir web_workflow yarat).
+				if wfID == "" || wfID == "wf_unknown" || wfID == "()" {
+					r.log.Info().
+						Str("event", "AUDIT_LOG_SKIPPED").
+						Str("call_id", callID).
+						Msg("⏭️ Web/Otonom oturum olduğu için PostgreSQL arşivleme atlandı.")
 				} else {
-					r.log.Info().Str("event", "AUDIT_LOG_ARCHIVED").Str("call_id", callID).Msg("💾 Workflow Audit Log archived (First & Only trigger).")
+					query := `
+						INSERT INTO workflow_execution_logs (call_id, workflow_id, status, final_state_data) 
+						VALUES ($1, $2, $3, $4::jsonb)
+					`
+					_, dbErr := r.db.Exec(ctx, query, callID, wfID, dbStatus, stateJSON)
+
+					if dbErr != nil {
+						r.log.Error().
+							Str("event", "DB_WRITE_FAIL").
+							Err(dbErr).
+							Str("call_id", callID).
+							Str("wf_id", wfID).
+							Msg("❌ DB Write Fail: Foreign Key uyuşmazlığı kontrol edilmeli.")
+					} else {
+						r.log.Info().Str("event", "AUDIT_LOG_ARCHIVED").Str("call_id", callID).Msg("💾 Workflow Audit Log archived.")
+					}
 				}
-
 			}
-			// Bellek temizliği için TTL'i düşür
 			r.redis.Expire(ctx, key, 5*time.Minute)
-		} else {
-			r.log.Debug().Str("event", "SESSION_ALREADY_ARCHIVED").Str("call_id", callID).Msg("⏭️ Session already archived. Skipping duplicate DB insert.")
 		}
-
 	}
 }
 

@@ -9,7 +9,7 @@ require (
 	github.com/redis/go-redis/v9 v9.5.1
 	github.com/rs/zerolog v1.34.0
 	// GÜNCELLEME: v1.19.0 (language ayrıştırması)
-	github.com/sentiric/sentiric-contracts v1.20.8
+	github.com/sentiric/sentiric-contracts v1.20.9
 	google.golang.org/grpc v1.75.1
 	google.golang.org/protobuf v1.36.10
 )
