@@ -54,7 +54,6 @@ func MapActionToWorkflowID(actionType string) string {
 func (r *WorkflowRepository) CreateSession(ctx context.Context, callID, workflowID, startNode, traceID string, rtpPort uint32, rtpTarget string) error {
 	key := fmt.Sprintf("wf_session:%s", callID)
 
-	// HSet ile Race-Condition riski olmadan Atomik yazma
 	err := r.redis.HSet(ctx, key, map[string]interface{}{
 		"call_id":      callID,
 		"workflow_id":  workflowID,
@@ -66,7 +65,6 @@ func (r *WorkflowRepository) CreateSession(ctx context.Context, callID, workflow
 		"updated_at":   time.Now().Format(time.RFC3339),
 	}).Err()
 	if err != nil {
-		// [ARCH-COMPLIANCE] ARCH-007
 		r.log.Error().Str("event", "REDIS_HSET_ERROR").Err(err).Msg("❌ Redis HSet error during CreateSession")
 		return err
 	}
@@ -85,17 +83,24 @@ func (r *WorkflowRepository) UpdateSessionStep(ctx context.Context, callID, step
 func (r *WorkflowRepository) UpdateSessionStatus(ctx context.Context, callID, status string) {
 	key := fmt.Sprintf("wf_session:%s", callID)
 
-	// 1. Redis durumunu her zaman güncelle
 	r.redis.HSet(ctx, key, "status", status, "updated_at", time.Now().Format(time.RFC3339))
 
-	// 2. Terminal durum kontrolü
 	if status == "COMPLETED" || status == "ERROR" || status == "HANDOVER_AGENT" {
 		isFirstTime, _ := r.redis.HSetNX(ctx, key, "is_archived", "true").Result()
 
 		if isFirstTime {
 			sessionData, err := r.GetSession(ctx, callID)
+
+			// [ARCH-COMPLIANCE FIX]: Orijinal Trace ID'yi Redis'ten okuyup loglara enjekte ediyoruz
+			traceID := "unknown"
+
 			if err == nil && len(sessionData) > 0 {
 				wfID := sessionData["workflow_id"]
+
+				if tID, ok := sessionData["trace_id"]; ok && tID != "" {
+					traceID = tID
+				}
+
 				stateJSON, _ := json.Marshal(sessionData)
 
 				dbStatus := status
@@ -103,11 +108,9 @@ func (r *WorkflowRepository) UpdateSessionStatus(ctx context.Context, callID, st
 					dbStatus = "FAILED"
 				}
 
-				// [ARCH-COMPLIANCE FIX]: Web/Otonom Oturum Koruması
-				// Eğer workflow_id boşsa veya "wf_unknown" ise, Foreign Key hatasını önlemek için
-				// bu logu sadece Redis'te bırak, PostgreSQL'e yazma. (Veya default bir web_workflow yarat).
 				if wfID == "" || wfID == "wf_unknown" || wfID == "()" {
 					r.log.Info().
+						Str("trace_id", traceID). // SUTS FIX
 						Str("event", "AUDIT_LOG_SKIPPED").
 						Str("call_id", callID).
 						Msg("⏭️ Web/Otonom oturum olduğu için PostgreSQL arşivleme atlandı.")
@@ -120,13 +123,18 @@ func (r *WorkflowRepository) UpdateSessionStatus(ctx context.Context, callID, st
 
 					if dbErr != nil {
 						r.log.Error().
+							Str("trace_id", traceID). // SUTS FIX
 							Str("event", "DB_WRITE_FAIL").
 							Err(dbErr).
 							Str("call_id", callID).
 							Str("wf_id", wfID).
 							Msg("❌ DB Write Fail: Foreign Key uyuşmazlığı kontrol edilmeli.")
 					} else {
-						r.log.Info().Str("event", "AUDIT_LOG_ARCHIVED").Str("call_id", callID).Msg("💾 Workflow Audit Log archived.")
+						r.log.Info().
+							Str("trace_id", traceID). // SUTS FIX
+							Str("event", "AUDIT_LOG_ARCHIVED").
+							Str("call_id", callID).
+							Msg("💾 Workflow Audit Log archived.")
 					}
 				}
 			}
@@ -156,10 +164,8 @@ func (r *WorkflowRepository) UpsertWorkflow(ctx context.Context, id, name, defin
 	return err
 }
 
-// GetAnnouncementPath, belirli bir dilde ve tenant'ta anons dosyasının yolunu DB'den çeker.
 func (r *WorkflowRepository) GetAnnouncementPath(ctx context.Context, annID, tenantID, langCode string) (string, error) {
 	var audioPath string
-	// Spesifik tenant'ı arar, bulamazsa 'system' tenant'ına (fallback) düşer.
 	query := `
         SELECT audio_path FROM announcements
         WHERE id = $1 AND language_code = $2 AND (tenant_id = $3 OR tenant_id = 'system')
